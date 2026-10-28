@@ -1,0 +1,93 @@
+name: Build Unsigned iOS IPA
+
+# 触发方式:
+# 1) 推送到 master/main 分支时自动构建
+# 2) 在 GitHub 仓库的 Actions 页面手动点击运行(workflow_dispatch)
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+
+# 同一分支的新推送会取消尚未完成的旧构建,节省额度
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build .ipa (unsigned) on macOS
+    # 使用 GitHub 提供的云端 macOS runner(含 Xcode),对 public 仓库免费
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 按 package-lock.json 精确安装 JS 依赖
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Select Xcode (latest stable)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # 由 Expo 生成原生 iOS(Xcode)工程;.gitignore 已忽略 /ios,故在 CI 现场生成
+      - name: Generate native iOS project (expo prebuild)
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd ios
+          pod install --repo-update
+
+      # 关键:CODE_SIGNING_ALLOWED=NO 产出“未签名”包,无需任何 Apple 证书/账号
+      - name: Build unsigned .app (Release / iphoneos)
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(find ios -maxdepth 1 -name '*.xcworkspace' | head -n 1)"
+          if [ -z "$WORKSPACE" ]; then echo "ERROR: no .xcworkspace found"; exit 1; fi
+          SCHEME="$(xcodebuild -list -workspace "$WORKSPACE" -json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);const s=(j.workspace&&j.workspace.schemes)||[];console.log(s[0]||'')})")"
+          if [ -z "$SCHEME" ]; then echo "ERROR: no scheme found"; exit 1; fi
+          echo "Workspace = $WORKSPACE"
+          echo "Scheme    = $SCHEME"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            clean build
+
+      # 把 .app 放进 Payload/ 并压缩成标准 .ipa 结构(未签名)
+      - name: Package into unsigned .ipa
+        run: |
+          set -euo pipefail
+          APP="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "$APP" ]; then echo "ERROR: no .app product found"; exit 1; fi
+          echo "App = $APP"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r -q LoginWebApp-unsigned.ipa Payload
+          echo "IPA packaged:"
+          ls -lh LoginWebApp-unsigned.ipa
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: LoginWebApp-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
