@@ -18,60 +18,36 @@ jobs:
     name: Build .ipa (unsigned) on macOS
     # 使用 GitHub 提供的云端 macOS runner(含 Xcode),对 public 仓库免费
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      # 按 package-lock.json 精确安装 JS 依赖
-      - name: Install JS dependencies
-        run: npm ci
+        uses: actions/checkout@v5
 
       - name: Select Xcode (latest stable)
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      # 必须在 pod install 之前打补丁(否则 podspec 的 SWIFT_VERSION 已被写进 xcconfig):
-      #  - expo-modules-jsi 的 podspec 固定 Swift 6.0,Xcode 26.3(Swift 6.2)报
-      #    "sending 'slot' risks causing data races" → 仅该 pod 降为 Swift 5.0
-      #  - 去掉 build-xcframework.sh 里嵌套 xcodebuild 的 -quiet(expo#50482 伪 error)
-      #  - 固定 SYMROOT/OBJROOT(expo#46326,新版已内置则 no-op)
-      - name: Patch ExpoModulesJSI (Swift 5.0 + Xcode workarounds)
-        run: python3 scripts/patch-expo-jsi.py
+      # 工程文件由 project.yml 现场生成,仓库里不提交 .xcodeproj
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
-      # 由 Expo 生成原生 iOS(Xcode)工程;.gitignore 已忽略 /ios,故在 CI 现场生成
-      - name: Generate native iOS project (expo prebuild)
-        run: npx expo prebuild --platform ios --clean --no-install
-
-      - name: Install CocoaPods dependencies
+      - name: Generate Xcode project
+        working-directory: native
         run: |
-          cd ios
-          pod install --repo-update
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild -list -project LoginWebApp.xcodeproj
 
       # 关键:CODE_SIGNING_ALLOWED=NO 产出“未签名”包,无需任何 Apple 证书/账号
       - name: Build unsigned .app (Release / iphoneos)
+        working-directory: native
         run: |
           set -euo pipefail
-          export NODE_BINARY="$(command -v node)"
-          export PATH="$(dirname "$NODE_BINARY"):$PATH"
-          echo "node = $NODE_BINARY"
-          WORKSPACE="$(find ios -maxdepth 1 -name '*.xcworkspace' | head -n 1)"
-          if [ -z "$WORKSPACE" ]; then echo "ERROR: no .xcworkspace found"; exit 1; fi
-          SCHEME="$(xcodebuild -list -workspace "$WORKSPACE" -json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);const s=(j.workspace&&j.workspace.schemes)||[];console.log(s[0]||"")}catch(e){console.log("")}})' || true)"
-          if [ -z "$SCHEME" ]; then SCHEME="$(basename "$WORKSPACE" .xcworkspace)"; fi
-          echo "Workspace = $WORKSPACE"
-          echo "Scheme    = $SCHEME"
           xcodebuild \
-            -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
+            -project LoginWebApp.xcodeproj \
+            -scheme LoginWebApp \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
@@ -79,24 +55,25 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             clean build 2>&1 | tee build.log
 
       # 编译失败时把关键错误行提取到 Job Summary,方便快速定位(Xcode 日志很长)
       - name: Extract build errors into summary
         if: failure()
+        working-directory: native
         run: |
           if [ -f build.log ]; then
             {
               echo "## Build errors (key lines)"
               echo '```'
-              grep -nE 'error:|did not produce|BUILD FAILED|ARCHIVE FAILED|The following build commands failed|Supported platforms|Command PhaseScriptExecution failed|Undefined symbol' build.log | tail -n 60 || true
+              grep -nE 'error:|BUILD FAILED|The following build commands failed|Undefined symbol|linker command failed' build.log | tail -n 40 || true
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # 把 .app 放进 Payload/ 并压缩成标准 .ipa 结构(未签名)
       - name: Package into unsigned .ipa
+        working-directory: native
         run: |
           set -euo pipefail
           APP="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)"
@@ -108,11 +85,12 @@ jobs:
           zip -r -q LoginWebApp-unsigned.ipa Payload
           echo "IPA packaged:"
           ls -lh LoginWebApp-unsigned.ipa
+          unzip -l LoginWebApp-unsigned.ipa | head -n 20
 
       - name: Upload .ipa artifact
         uses: actions/upload-artifact@v4
         with:
           name: ios-unsigned-ipa
-          path: LoginWebApp-unsigned.ipa
+          path: native/LoginWebApp-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
