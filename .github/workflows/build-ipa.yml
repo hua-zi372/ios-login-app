@@ -52,23 +52,28 @@ jobs:
       - name: Build unsigned .app (Release / iphoneos)
         run: |
           set -euo pipefail
+          export NODE_BINARY="$(command -v node)"
+          export PATH="$(dirname "$NODE_BINARY"):$PATH"
+          echo "node = $NODE_BINARY"
           WORKSPACE="$(find ios -maxdepth 1 -name '*.xcworkspace' | head -n 1)"
           if [ -z "$WORKSPACE" ]; then echo "ERROR: no .xcworkspace found"; exit 1; fi
-          SCHEME="$(xcodebuild -list -workspace "$WORKSPACE" -json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);const s=(j.workspace&&j.workspace.schemes)||[];console.log(s[0]||'')})")"
-          if [ -z "$SCHEME" ]; then echo "ERROR: no scheme found"; exit 1; fi
+          SCHEME="$(xcodebuild -list -workspace "$WORKSPACE" -json 2>/dev/null | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);const s=(j.workspace&&j.workspace.schemes)||[];console.log(s[0]||"")}catch(e){console.log("")}})' || true)"
+          if [ -z "$SCHEME" ]; then SCHEME="$(basename "$WORKSPACE" .xcworkspace)"; fi
           echo "Workspace = $WORKSPACE"
           echo "Scheme    = $SCHEME"
+          set -o pipefail
           xcodebuild \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
-            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            clean build
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            clean build 2>&1 | tail -n 120
 
       # 把 .app 放进 Payload/ 并压缩成标准 .ipa 结构(未签名)
       - name: Package into unsigned .ipa
