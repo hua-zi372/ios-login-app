@@ -39,6 +39,14 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      # 必须在 pod install 之前打补丁(否则 podspec 的 SWIFT_VERSION 已被写进 xcconfig):
+      #  - expo-modules-jsi 的 podspec 固定 Swift 6.0,Xcode 26.3(Swift 6.2)报
+      #    "sending 'slot' risks causing data races" → 仅该 pod 降为 Swift 5.0
+      #  - 去掉 build-xcframework.sh 里嵌套 xcodebuild 的 -quiet(expo#50482 伪 error)
+      #  - 固定 SYMROOT/OBJROOT(expo#46326,新版已内置则 no-op)
+      - name: Patch ExpoModulesJSI (Swift 5.0 + Xcode workarounds)
+        run: python3 scripts/patch-expo-jsi.py
+
       # 由 Expo 生成原生 iOS(Xcode)工程;.gitignore 已忽略 /ios,故在 CI 现场生成
       - name: Generate native iOS project (expo prebuild)
         run: npx expo prebuild --platform ios --clean --no-install
@@ -47,12 +55,6 @@ jobs:
         run: |
           cd ios
           pod install --repo-update
-
-      # 修复 Xcode 26/27 下 ExpoModulesJSI 嵌套 xcodebuild 报错:
-      #  - expo#50482:Xcode 在 -quiet 下对成功的编译任务输出伪 error 行 → 去掉 -quiet
-      #  - expo#46326/PR#46377:固定 SYMROOT/OBJROOT,防止产物写出 DerivedData 之外
-      - name: Patch ExpoModulesJSI for Xcode 26/27
-        run: python3 scripts/patch-expo-jsi.py
 
       # 关键:CODE_SIGNING_ALLOWED=NO 产出“未签名”包,无需任何 Apple 证书/账号
       - name: Build unsigned .app (Release / iphoneos)

@@ -1,43 +1,60 @@
 #!/usr/bin/env python3
-"""Patch ExpoModulesJSI's apple/scripts/build-xcframework.sh for Xcode 26/27.
+"""Patch ExpoModulesJSI for Xcode 26.3 / Swift 6.2 compatibility.
 
-Two independent, repeat-safe fixes:
+Run this BEFORE `pod install` (the podspec change must be picked up when
+CocoaPods writes the pods xcconfig) and before the Xcode build (the script
+change is used by the [CP-User] Build ExpoModulesJSI xcframework phase).
 
-1. (expo#50482 / PR#50587) Xcode prints a bogus line while the nested
-   xcodebuild runs with `-quiet`:
-     error: the following command failed with exit code 0 but produced no further output
-   It is emitted for a *successful* SwiftCompile job, but the outer script phase
-   parses it as a real error and fails. Dropping `-quiet` avoids the bogus line
-   and makes any genuine compiler error visible.
+1. podspec: lower SWIFT_VERSION 6.0 -> 5.0 for this pod only.
+   Xcode 26.3 ships Swift 6.2 which fails ExpoModulesJSI with
+     JavaScriptObject.swift:946: error: sending 'slot' risks causing data races
+   Swift 5 language mode disables that check for this pod only.
 
-2. (expo#46326 / PR#46377) Pin SYMROOT/OBJROOT on the nested xcodebuild so build
-   products land where the script expects them (Xcode ignores
-   -derivedDataPath for auto-generated SwiftPM schemes). Newer
-   expo-modules-jsi already ships this, so it is a no-op there.
+2. build-xcframework.sh: drop `-quiet` from the nested xcodebuild.
+   (expo#50482: Xcode prints a bogus "exit code 0 but produced no further
+   output" error line under -quiet and the outer phase treats it as fatal.)
+
+3. build-xcframework.sh: pin SYMROOT/OBJROOT when not already present.
+   (expo#46326 / PR#46377; newer expo-modules-jsi already ships this.)
 """
+import re
 import sys
 from pathlib import Path
 
-TARGET = Path("node_modules/expo-modules-jsi/apple/scripts/build-xcframework.sh")
+PODSPEC = Path("node_modules/expo-modules-jsi/apple/ExpoModulesJSI.podspec")
+BUILD_SCRIPT = Path("node_modules/expo-modules-jsi/apple/scripts/build-xcframework.sh")
 
 
-def main() -> int:
-    if not TARGET.exists():
-        print(f"[patch] target not found: {TARGET}")
-        return 1
+def patch_podspec() -> None:
+    if not PODSPEC.exists():
+        print(f"[patch] podspec not found: {PODSPEC}")
+        return
+    src = PODSPEC.read_text(encoding="utf-8")
+    if re.search(r"s\.swift_version\s*=\s*'5\.0'", src):
+        print("[patch] podspec already Swift 5.0")
+        return
+    new, n = re.subn(r"s\.swift_version\s*=\s*'6\.0'", "s.swift_version  = '5.0'", src, count=1)
+    if n == 0:
+        print("[patch] WARNING: podspec swift_version pattern not found")
+        return
+    PODSPEC.write_text(new, encoding="utf-8")
+    print("[patch] podspec: SWIFT_VERSION 6.0 -> 5.0")
 
-    src = TARGET.read_text(encoding="utf-8")
+
+def patch_build_script() -> None:
+    if not BUILD_SCRIPT.exists():
+        print(f"[patch] build script not found: {BUILD_SCRIPT}")
+        return
+    src = BUILD_SCRIPT.read_text(encoding="utf-8")
     original = src
 
-    # --- fix 1: drop -quiet so Xcode stops emitting the bogus error line ---
     quiet_line = "    -quiet \\\n"
     if quiet_line in src:
         src = src.replace(quiet_line, "", 1)
         print("[patch] removed -quiet from nested xcodebuild")
     else:
-        print("[patch] -quiet not present (already removed or different layout)")
+        print("[patch] -quiet not present")
 
-    # --- fix 2: pin SYMROOT/OBJROOT when the vendored version does not ---
     if 'SYMROOT="${BUILD_PRODUCTS_PATH}"' in src:
         print("[patch] SYMROOT/OBJROOT already pinned")
     else:
@@ -50,18 +67,18 @@ def main() -> int:
             src = src.replace(anchor, anchor + inject, 1)
             print("[patch] pinned SYMROOT/OBJROOT")
         else:
-            print("[patch] WARNING: SYMROOT anchor missing, skipped")
+            print("[patch] WARNING: SYMROOT anchor missing")
 
     if src == original:
-        print("[patch] no change applied")
-        return 0
+        print("[patch] build script unchanged")
+        return
+    BUILD_SCRIPT.write_text(src, encoding="utf-8")
+    print("[patch] build script updated")
 
-    TARGET.write_text(src, encoding="utf-8")
-    print("[patch] done")
 
-    for n, line in enumerate(src.splitlines(), 1):
-        if "-quiet" in line or "SYMROOT=" in line or "OBJROOT=" in line or "-parallelizeTargets" in line:
-            print(f"  {n}: {line}")
+def main() -> int:
+    patch_podspec()
+    patch_build_script()
     return 0
 
 
