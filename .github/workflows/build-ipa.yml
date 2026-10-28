@@ -48,6 +48,11 @@ jobs:
           cd ios
           pod install --repo-update
 
+      # 修复 Xcode 26 下 ExpoModulesJSI 嵌套 xcodebuild 报错(expo#46326 / PR#46377):
+      # 固定 SYMROOT/OBJROOT,防止产物被写到 DerivedData 之外导致 "did not produce framework"
+      - name: Patch ExpoModulesJSI for Xcode 26 (pin SYMROOT/OBJROOT)
+        run: python3 scripts/patch-expo-jsi.py
+
       # 关键:CODE_SIGNING_ALLOWED=NO 产出“未签名”包,无需任何 Apple 证书/账号
       - name: Build unsigned .app (Release / iphoneos)
         run: |
@@ -61,7 +66,6 @@ jobs:
           if [ -z "$SCHEME" ]; then SCHEME="$(basename "$WORKSPACE" .xcworkspace)"; fi
           echo "Workspace = $WORKSPACE"
           echo "Scheme    = $SCHEME"
-          set -o pipefail
           xcodebuild \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
@@ -73,7 +77,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            clean build 2>&1 | tail -n 120
+            clean build 2>&1
 
       # 把 .app 放进 Payload/ 并压缩成标准 .ipa 结构(未签名)
       - name: Package into unsigned .ipa
