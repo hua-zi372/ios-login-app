@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Fix ExpoModulesJSI nested xcodebuild on Xcode 26.
+"""Patch ExpoModulesJSI's apple/scripts/build-xcframework.sh for Xcode 26/27.
 
-Refs:
-  - expo/expo issue #46326  (nested xcodebuild -> "Supported platforms ... empty")
-  - expo/expo PR    #46377  (official fix: pin SYMROOT/OBJROOT)
+Two independent, repeat-safe fixes:
 
-Xcode 26 ignores -derivedDataPath for the auto-generated SwiftPM scheme used by
-ExpoModulesJSI and writes build products outside DERIVED_DATA_PATH, so the
-"did not produce framework" check in build-xcframework.sh fails (exit 65).
-Pinning SYMROOT/OBJROOT on the nested xcodebuild invocation forces the products
-back into the expected location. On Xcode versions that honor -derivedDataPath
-this is a no-op.
+1. (expo#50482 / PR#50587) Xcode prints a bogus line while the nested
+   xcodebuild runs with `-quiet`:
+     error: the following command failed with exit code 0 but produced no further output
+   It is emitted for a *successful* SwiftCompile job, but the outer script phase
+   parses it as a real error and fails. Dropping `-quiet` avoids the bogus line
+   and makes any genuine compiler error visible.
+
+2. (expo#46326 / PR#46377) Pin SYMROOT/OBJROOT on the nested xcodebuild so build
+   products land where the script expects them (Xcode ignores
+   -derivedDataPath for auto-generated SwiftPM schemes). Newer
+   expo-modules-jsi already ships this, so it is a no-op there.
 """
 import sys
 from pathlib import Path
@@ -24,31 +27,40 @@ def main() -> int:
         return 1
 
     src = TARGET.read_text(encoding="utf-8")
+    original = src
 
-    marker = 'SYMROOT="${BUILD_PRODUCTS_PATH}"'
-    if marker in src:
-        print("[patch] already patched, nothing to do")
+    # --- fix 1: drop -quiet so Xcode stops emitting the bogus error line ---
+    quiet_line = "    -quiet \\\n"
+    if quiet_line in src:
+        src = src.replace(quiet_line, "", 1)
+        print("[patch] removed -quiet from nested xcodebuild")
+    else:
+        print("[patch] -quiet not present (already removed or different layout)")
+
+    # --- fix 2: pin SYMROOT/OBJROOT when the vendored version does not ---
+    if 'SYMROOT="${BUILD_PRODUCTS_PATH}"' in src:
+        print("[patch] SYMROOT/OBJROOT already pinned")
+    else:
+        anchor = "-parallelizeTargets \\\n"
+        inject = (
+            "    SYMROOT=\"${BUILD_PRODUCTS_PATH}\" \\\n"
+            "    OBJROOT=\"${DERIVED_DATA_PATH}/Build/Intermediates.noindex\" \\\n"
+        )
+        if anchor in src:
+            src = src.replace(anchor, anchor + inject, 1)
+            print("[patch] pinned SYMROOT/OBJROOT")
+        else:
+            print("[patch] WARNING: SYMROOT anchor missing, skipped")
+
+    if src == original:
+        print("[patch] no change applied")
         return 0
 
-    anchor = "-parallelizeTargets \\\n"
-    inject = (
-        "    SYMROOT=\"${BUILD_PRODUCTS_PATH}\" \\\n"
-        "    OBJROOT=\"${DERIVED_DATA_PATH}/Build/Intermediates.noindex\" \\\n"
-    )
-
-    if anchor not in src:
-        idx = src.find("-parallelizeTargets")
-        print("[patch] ANCHOR NOT FOUND, dumping context for inspection")
-        if idx >= 0:
-            print(src[max(0, idx - 120): idx + 320])
-        return 1
-
-    src = src.replace(anchor, anchor + inject, 1)
     TARGET.write_text(src, encoding="utf-8")
-    print("[patch] patched OK")
+    print("[patch] done")
 
     for n, line in enumerate(src.splitlines(), 1):
-        if "SYMROOT=" in line or "OBJROOT=" in line or "-parallelizeTargets" in line:
+        if "-quiet" in line or "SYMROOT=" in line or "OBJROOT=" in line or "-parallelizeTargets" in line:
             print(f"  {n}: {line}")
     return 0
 

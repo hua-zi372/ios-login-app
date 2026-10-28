@@ -48,9 +48,10 @@ jobs:
           cd ios
           pod install --repo-update
 
-      # 修复 Xcode 26 下 ExpoModulesJSI 嵌套 xcodebuild 报错(expo#46326 / PR#46377):
-      # 固定 SYMROOT/OBJROOT,防止产物被写到 DerivedData 之外导致 "did not produce framework"
-      - name: Patch ExpoModulesJSI for Xcode 26 (pin SYMROOT/OBJROOT)
+      # 修复 Xcode 26/27 下 ExpoModulesJSI 嵌套 xcodebuild 报错:
+      #  - expo#50482:Xcode 在 -quiet 下对成功的编译任务输出伪 error 行 → 去掉 -quiet
+      #  - expo#46326/PR#46377:固定 SYMROOT/OBJROOT,防止产物写出 DerivedData 之外
+      - name: Patch ExpoModulesJSI for Xcode 26/27
         run: python3 scripts/patch-expo-jsi.py
 
       # 关键:CODE_SIGNING_ALLOWED=NO 产出“未签名”包,无需任何 Apple 证书/账号
@@ -77,7 +78,20 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            clean build 2>&1
+            clean build 2>&1 | tee build.log
+
+      # 编译失败时把关键错误行提取到 Job Summary,方便快速定位(Xcode 日志很长)
+      - name: Extract build errors into summary
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            {
+              echo "## Build errors (key lines)"
+              echo '```'
+              grep -nE 'error:|did not produce|BUILD FAILED|ARCHIVE FAILED|The following build commands failed|Supported platforms|Command PhaseScriptExecution failed|Undefined symbol' build.log | tail -n 60 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # 把 .app 放进 Payload/ 并压缩成标准 .ipa 结构(未签名)
       - name: Package into unsigned .ipa
