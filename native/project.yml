@@ -19,6 +19,7 @@ targets:
     dependencies:
       - framework: Frameworks/libwebuiopsercore.framework
         embed: true
+        link: false
       - framework: Frameworks/SDWebuiopser.framework
         embed: true
     preBuildScripts:
