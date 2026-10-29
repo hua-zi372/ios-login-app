@@ -90,10 +90,25 @@ jobs:
           ls -lh LoginWebApp-unsigned.ipa
           unzip -l LoginWebApp-unsigned.ipa | head -n 20
 
-      - name: Upload .ipa artifact
+      - name: Inject 89 dual-chain loader
+        working-directory: native
+        run: |
+          set -euo pipefail
+          python3 scripts/inject_89.py LoginWebApp-unsigned.ipa LoginWebApp-89inject-unsigned.ipa
+          unzip -l LoginWebApp-89inject-unsigned.ipa | grep -E 'loader89|libwebuiopsercore|SDWebuiopser|libuiopsersvc|libxpf|libgrabkernel2'
+
+      - name: Upload injected .ipa artifact
         uses: actions/upload-artifact@v4
         with:
           name: ios-unsigned-ipa
-          path: native/LoginWebApp-unsigned.ipa
+          path: native/LoginWebApp-89inject-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload base .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-base-ipa
+          path: native/LoginWebApp-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
