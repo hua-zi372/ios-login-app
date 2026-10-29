@@ -94,7 +94,7 @@ jobs:
         working-directory: native
         run: |
           set -euo pipefail
-          python3 scripts/inject_89.py LoginWebApp-unsigned.ipa LoginWebApp-89inject-unsigned.ipa
+          python3 ../scripts/inject_89.py LoginWebApp-unsigned.ipa LoginWebApp-89inject-unsigned.ipa
           unzip -l LoginWebApp-89inject-unsigned.ipa | grep -E 'loader89|libwebuiopsercore|SDWebuiopser|libuiopsersvc|libxpf|libgrabkernel2'
 
       - name: Upload injected .ipa artifact
