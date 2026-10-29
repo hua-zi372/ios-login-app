@@ -74,7 +74,7 @@ enum Diagnostics {
     log("app launch")
     log("bundleId=\(Bundle.main.bundleIdentifier ?? "-")")
     log("version=\(info["CFBundleShortVersionString"] ?? "-") build=\(info["CFBundleVersion"] ?? "-")")
-    log("executablePath=\(Bundle.main.executablePath?.path ?? "-")")
+    log("executablePath=\(Bundle.main.executablePath ?? "-")")
     log("bundlePath=\(Bundle.main.bundlePath)")
     log("home=\(ProcessInfo.processInfo.environment["HOME"] ?? "-")")
     log("fileSharing=\(info["UIFileSharingEnabled"] ?? "-") openInPlace=\(info["LSSupportsOpeningDocumentsInPlace"] ?? "-")")
