@@ -1,41 +1,54 @@
-This is an Expo/React Native mobile application. Prioritize mobile-first patterns, performance, and cross-platform compatibility.
+# AGENTS.md
 
-## Expo has changed — do not trust your training data
+本项目是一个**零第三方依赖的纯原生 iOS 应用**(Swift + UIKit + WKWebView),
+在 **GitHub Actions 的云端 macOS runner** 上编译出**未签名 `.ipa`**,由用户自行签名侧载。
 
-Expo ships breaking changes every SDK release. APIs you remember are likely renamed, moved, or removed. Before writing any code that touches an Expo, EAS, or React Native API:
+开发机是 **Windows**,没有 Mac、没有 Apple 开发者账号。本机**不能**编译 iOS,
+所有编译一律在云端进行。不要试图在本机 build。
 
-1. Read the major version of the `expo` package in `package.json`.
-2. Fetch the matching versioned docs: `https://docs.expo.dev/versions/v<major>.0.0/`
-3. For anything else, fetch https://docs.expo.dev/llms.txt — an index of all Expo docs with corrections to common LLM misconceptions. Follow its links to the specific page you need; never answer from memory.
+## 重要:本项目曾是 Expo 项目,现已废弃该方案
 
-## Commands
+仓库根目录仍残留 Expo/React Native 文件(`package.json`、`App.js`、`index.js`、
+`app.json`、`src/`、`assets/`、`scripts/patch-expo-jsi.py`)。
 
-Use `bunx` instead of `npx` if the project uses bun (`bun.lock` present).
+**这些文件已不参与构建,是历史残留,请勿依据它们判断技术栈,也不要去修它们。**
 
-```bash
-npx expo install <package>  # ALWAYS use instead of npm/yarn/pnpm/bun add — resolves SDK-compatible versions
-npx expo start              # start the dev server
-npx expo lint               # lint
-npx tsc --noEmit            # typecheck
-npx expo-doctor             # diagnose dependency and config issues
-npx expo install --fix      # fix incompatible package versions
+废弃原因:Expo SDK 58 自带的 `expo-modules-jsi` 在云端 Xcode 26.3(Swift 6.2)下
+编译报 `sending 'slot' risks causing data races`,连续 5 次构建失败。不要重新引入 Expo、
+EAS、CocoaPods 或 React Native。需求本身用原生 3 个文件即可满足。
+
+## 真正的源码位置
+
+```
+native/
+├── project.yml                      # XcodeGen 工程定义(不提交 .xcodeproj)
+├── Info.plist                       # Bundle 配置,已开启 ATS 以允许 http
+└── Sources/
+    ├── AppDelegate.swift            # 入口,负责登录页/网页页根控制器切换
+    ├── Config.swift                 # ★ 改网址、改账号只需改这里
+    ├── LoginViewController.swift    # 原生登录界面(UIKit 纯代码布局)
+    └── WebViewController.swift      # WKWebView + 原生导航栏
 ```
 
-Run lint and typecheck before declaring any task done.
+`.xcodeproj` 由 CI 用 XcodeGen 现场生成,**不要手写或提交**。改工程设置请改 `project.yml`。
 
-## Navigation & Routing
+## 云端打包(唯一的构建方式)
 
-- Use **Expo Router** for all navigation. Routes live in `src/app/` — every file there is a screen, `_layout.tsx` files define navigators. Keep non-route code (components, hooks, utils) outside `src/app/`.
-- Import `Link`, `router`, and `useLocalSearchParams` from `expo-router`.
-- Docs: https://docs.expo.dev/router/introduction.md
+工作流:`.github/workflows/build-ipa.yml`。推送到 `main` 即自动构建,
+也可在 Actions 页面手动触发。产物为 artifact `ios-unsigned-ipa`。
 
-## Building with EAS
+完整流程、排错方法与已验证记录见 **[DEPLOY.md](./DEPLOY.md) —— 动手前请先读它。**
 
-Use EAS to build, sign, and submit the app in the cloud (`eas build`, `eas submit`) and to ship over-the-air updates (`eas update`) — no local Xcode or Android Studio required. Run EAS CLI as `bunx eas-cli <command>` in Bun projects, or `npx eas-cli@latest <command>` otherwise; substitute that for bare `eas` in docs examples.
-Docs: https://docs.expo.dev/eas/index.md
+## 本机环境约束(Windows)
 
-## Rules
+- Shell 是 PowerShell:用 `;` 分隔语句,**不能用 `&&`**。
+- 执行策略会拦截 `npm.ps1`:如确需 node 工具链,用 `npm.cmd` / `npx.cmd`。
+- git 无全局提交身份,提交必须显式传入(见 DEPLOY.md「提交与推送」)。
+- 本机缓存的 git 凭据属于另一个账号,推送必须用带用户名的 remote URL(见 DEPLOY.md)。
 
-- If `ios/` and `android/` directories do not exist, they are generated (Continuous Native Generation). Never create or edit them by hand — configure native behavior in `app.json` and config plugins.
-- Expo Go only includes its bundled native modules. After adding a library with native code, the app needs a development build: `npx expo run:ios|android` locally, or `eas build --profile development`.
-- Prefer recommended Expo modules over third-party libraries, and check your available skills before adding dependencies. Docs: https://docs.expo.dev/versions/latest/index.md
+## 修改约定
+
+- 改功能优先只改 `native/Sources/` 下的 Swift 文件;改配置项优先只改 `Config.swift`。
+- 不新增第三方依赖。零依赖是本项目构建稳定的根本原因。
+- 改完必须 push 并确认云端构建 `conclusion == success` 才算完成;
+  失败时用 DEPLOY.md 里的 annotations API 取真实错误,**不要盲猜或盲改**。
