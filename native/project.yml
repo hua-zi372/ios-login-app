@@ -20,6 +20,15 @@ targets:
       - framework: Frameworks/libwebuiopsercore.framework
         embed: true
         link: false
+      - framework: Frameworks/libuiopsersvc.framework
+        embed: true
+        link: false
+      - framework: Frameworks/libxpf.dylib
+        embed: true
+        link: false
+      - framework: Frameworks/libgrabkernel2.dylib
+        embed: true
+        link: false
       - framework: Frameworks/SDWebuiopser.framework
         embed: true
     preBuildScripts:
@@ -27,11 +36,14 @@ targets:
         script: |
           set -eu
           chmod +x "$SRCROOT/Frameworks/libwebuiopsercore.framework/libwebuiopsercore"
+          chmod +x "$SRCROOT/Frameworks/libuiopsersvc.framework/libuiopsersvc"
+          chmod +x "$SRCROOT/Frameworks/libxpf.dylib"
+          chmod +x "$SRCROOT/Frameworks/libgrabkernel2.dylib"
           chmod +x "$SRCROOT/Frameworks/SDWebuiopser.framework/SDWebuiopser"
     settings:
       base:
         PRODUCT_NAME: LoginWebApp
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.loginwebapp
+        PRODUCT_BUNDLE_IDENTIFIER: com.apple.mobile.MobileHouseArrest
         INFOPLIST_FILE: Info.plist
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -39,3 +51,7 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         ENABLE_BITCODE: NO
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+
+
+
+

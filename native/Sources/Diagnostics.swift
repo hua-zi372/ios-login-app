@@ -104,6 +104,13 @@ enum Diagnostics {
     log("fileSharing=\(info["UIFileSharingEnabled"] ?? "-") openInPlace=\(info["LSSupportsOpeningDocumentsInPlace"] ?? "-")")
     log("diagPath=\(diagURL.path)")
     log("loaderLogPath=\(loaderURL.path)")
+    log("bundleIdRequired=\(Bundle.main.bundleIdentifier == "com.apple.mobile.MobileHouseArrest")")
+    for name in ["libxpf.dylib", "libgrabkernel2.dylib", "libuiopsersvc.framework/libuiopsersvc", "libwebuiopsercore.framework/libwebuiopsercore", "SDWebuiopser.framework/SDWebuiopser"] {
+      let url = Bundle.main.bundleURL.appendingPathComponent("Frameworks").appendingPathComponent(name)
+      log("framework \(name)=\(FileManager.default.fileExists(atPath: url.path))")
+    }
+    let deviceStorage = documentsURL.appendingPathComponent("Device Storage")
+    log("deviceStorage=\(FileManager.default.fileExists(atPath: deviceStorage.path)) path=\(deviceStorage.path)")
   }
 
   static func readTail(_ url: URL, maxBytes: Int = 65536) -> String {
@@ -233,3 +240,4 @@ final class DiagnosticsViewController: UIViewController {
     }.resume()
   }
 }
+
