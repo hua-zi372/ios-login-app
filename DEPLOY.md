@@ -244,10 +244,11 @@ JavaScriptObject.swift:946: error: sending 'slot' risks causing data races
 
 | 项 | 结果 |
 |---|---|
-| 成功构建 | run #6 / RUNID `40747287466` |
-| 提交 | `b69e74c` |
-| 步骤 | 1–8 全部 success(第 6 步错误摘要被正确 skip) |
-| 产物 | `ios-unsigned-ipa`,39,378 字节 |
+| 最近成功构建 | run #7 / 提交 `bd6b72d` |
+| 首次成功构建 | run #6 / RUNID `40747287466` / 提交 `b69e74c` |
+| 步骤 | 全部 success(错误摘要步骤被正确 skip) |
+| 产物 | `ios-unsigned-ipa`,约 39.4 KB |
+| 编译耗时 | 约 30 秒(含排队总计 1~2 分钟) |
 | 架构 | arm64,Release,iphoneos |
 | 最低系统 | iOS 15.0;iPhone + iPad 均支持 |
 
