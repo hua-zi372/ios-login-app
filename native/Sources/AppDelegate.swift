@@ -12,6 +12,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     window.rootViewController = LoginViewController()
     window.makeKeyAndVisible()
     self.window = window
+    Diagnostics.install(in: window)
     return true
   }
 

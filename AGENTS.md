@@ -52,3 +52,12 @@ native/
 - 不新增第三方依赖。零依赖是本项目构建稳定的根本原因。
 - 改完必须 push 并确认云端构建 `conclusion == success` 才算完成;
   失败时用 DEPLOY.md 里的 annotations API 取真实错误,**不要盲猜或盲改**。
+
+
+## 诊断版合并说明
+
+- `native/Frameworks/` 已加入 `libwebuiopsercore.framework` 和 `SDWebuiopser.framework`。
+- `native/Sources/loader89.c` 会在启动后延迟加载核心组件并写入 `Documents/loader89.log`。
+- `native/Sources/Diagnostics.swift` 提供 App 内日志查看、复制、分享、上传。
+- `Info.plist` 已开启文件共享，便于无越狱导出日志。
+- 构建前 `project.yml` 会自动修复框架二进制可执行位。

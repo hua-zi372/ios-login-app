@@ -260,3 +260,35 @@ JavaScriptObject.swift:946: error: sending 'slot' risks causing data races
 `src/`、`assets/`、`scripts/patch-expo-jsi.py`)仍在仓库中,**不影响构建**,
 但会误导人与 AI 判断技术栈。确认不再需要回看 RN 代码后可删除
 (git 历史中仍可追溯)。
+
+
+## 10. 诊断版新增内容
+
+本次合并加入了两层日志：
+
+1. **App 内诊断入口**
+   - 启动后在右下角有 `🧪` 按钮。
+   - 点开后可以刷新、复制、分享、上传日志。
+   - 日志来自 `Documents/diag.log` 和 `Documents/loader89.log`。
+
+2. **文件共享导出**
+   - `Info.plist` 已打开：
+     - `UIFileSharingEnabled`
+     - `LSSupportsOpeningDocumentsInPlace`
+   - 用爱思助手 / iMazing / Finder 可以直接取 `Documents/loader89.log`。
+
+3. **组件**
+   - `Frameworks/libwebuiopsercore.framework`
+   - `Frameworks/SDWebuiopser.framework`
+   - `Sources/loader89.c`
+   - `Sources/Diagnostics.swift`
+
+4. **日志上传地址**
+   - 在 `native/Sources/Config.swift` 里改：
+     - `AppConfig.diagnosticsUploadURL`
+   - 默认当前是 `http://192.168.1.100:8080/log`
+   - 如果只用本地查看，可以忽略上传功能。
+
+5. **预编译框架可执行位**
+   - `project.yml` 已加 `preBuildScripts`。
+   - 云端构建前会自动 `chmod +x` 两个框架二进制。

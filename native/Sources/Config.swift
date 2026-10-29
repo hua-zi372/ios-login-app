@@ -17,4 +17,7 @@ enum AppConfig {
 
   static let primaryColor = UIColor(red: 0.184, green: 0.435, blue: 0.929, alpha: 1)
   static let backgroundColor = UIColor(red: 0.953, green: 0.961, blue: 0.976, alpha: 1)
+
+  /// 诊断日志上传地址；不使用时可设为 nil
+  static let diagnosticsUploadURL: URL? = URL(string: "http://192.168.1.167:8080/log")
 }
