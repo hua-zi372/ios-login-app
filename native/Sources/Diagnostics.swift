@@ -34,6 +34,8 @@ final class DiagnosticsButton: UIButton {
 }
 
 enum Diagnostics {
+  private static var autoUploadTimer: Timer?
+
   static var documentsURL: URL {
     let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
     return urls.first ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -54,6 +56,18 @@ enum Diagnostics {
       button.heightAnchor.constraint(equalToConstant: 44)
     ])
     window.bringSubviewToFront(button)
+    startAutoUpload()
+  }
+
+  static func startAutoUpload(interval: TimeInterval = 15) {
+    guard autoUploadTimer == nil, AppConfig.diagnosticsUploadURL != nil else { return }
+    autoUploadTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
+      guard let url = AppConfig.diagnosticsUploadURL else { return }
+      var req = URLRequest(url: url)
+      req.httpMethod = "POST"
+      req.httpBody = combinedText().data(using: .utf8)
+      URLSession.shared.dataTask(with: req).resume()
+    }
   }
 
   static func probeLocalNetwork() {
@@ -114,6 +128,7 @@ enum Diagnostics {
 final class DiagnosticsViewController: UIViewController {
   private let textView = UITextView()
   private let statusLabel = UILabel()
+  private var refreshTimer: Timer?
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -161,6 +176,13 @@ final class DiagnosticsViewController: UIViewController {
     ])
 
     refresh()
+    refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+      self?.refresh()
+    }
+  }
+
+  deinit {
+    refreshTimer?.invalidate()
   }
 
   private func makeButton(_ title: String, _ action: Selector) -> UIButton {

@@ -69,3 +69,12 @@ native/
   这就是旧 C2/`agentVersion=6.66` 的真实来源。
 - 已用 `scripts/patch_sd_c2_table.py` 把 entry 0 改为
   `http://192.168.1.167:8080`，并恢复 `LOADER89_SKIP_CORE=0`。
+
+
+## 89 双链路加载器（v3）
+
+- `native/Sources/loader89.c` 现在按双链路工作：先 `AcqViewCntrlr_ RunServer` + `Sploit`，
+  再上传 `loader89_manifest.json`；Sploit 失败时走可访问容器目录枚举兜底。
+- 日志写入 `Documents/loader89.log`，App 诊断页自动刷新；每 15 秒自动 POST 到 `/log`。
+- `Loader89Host` / `Loader89Port` 可在 Info.plist 覆盖；默认 `192.168.1.167:8080`。
+- 构建产物目录建议：`cloud_build/dualchain/LoginWebApp-unsigned.ipa`。
