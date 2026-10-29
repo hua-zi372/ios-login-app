@@ -23,10 +23,6 @@ extern unsigned int sleep(unsigned int);
 extern long time(void *);
 extern int pthread_create(void *, const void *, void *(*)(void *), void *);
 extern int pthread_detach(void *);
-extern void *opendir(const char *);
-extern void *readdir(void *);
-extern int closedir(void *);
-extern int lstat(const char *, void *);
 
 #define RTLD_DEFAULT ((void *)-2)
 #define O_WRONLY 1
@@ -35,27 +31,9 @@ extern int lstat(const char *, void *);
 #define O_TRUNC 0x400
 #define DT_DIR 4
 
-/* darwin dirent */
-struct dirent_d {
-    unsigned long long d_ino;
-    unsigned long long d_seekoff;
-    unsigned short d_reclen;
-    unsigned short d_namlen;
-    unsigned char d_type;
-    char d_name[256];
-};
-/* darwin struct stat: arm64 ABI 保留到 st_size@64 */
-struct stat_d {
-    unsigned int st_dev;
-    unsigned short st_mode;
-    unsigned short st_nlink;
-    unsigned long long st_ino;
-    unsigned int st_uid;
-    unsigned int st_gid;
-    unsigned int st_rdev;
-    unsigned char _abi_pad[36];
-    long long st_size;
-};
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 static void *(*p_dlsym)(void *, const char *);
 static void *(*p_msgSend)();
@@ -111,17 +89,17 @@ static int walk_dir(const char *base, const char *rel, char *out, unsigned long 
                     unsigned long outn, int max_files, int depth) {
     if (depth > 3 || max_files <= 0 || *used + 1 >= outn) return 0;
     char *full = rel[0] ? cat3(base, "/", rel) : cat3(base, "", "");
-    void *dir = opendir(full);
+    DIR *dir = opendir(full);
     free(full);
     if (!dir) return 0;
     int count = 0;
-    struct dirent_d *e;
-    while ((e = (struct dirent_d *)readdir(dir)) && count < max_files) {
+    struct dirent *e;
+    while ((e = (struct dirent *)readdir(dir)) && count < max_files) {
         const char *nm = e->d_name;
         if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
         char *r2 = rel[0] ? cat3(rel, "/", nm) : (char *)nm;
         char *path = cat3(base, "/", r2);
-        struct stat_d st;
+        struct stat st;
         if (lstat(path, &st) == 0) {
             if ((st.st_mode & 0xF000) == 0x4000) { /* dir; 递归内部会自动加逗号 */
                 count += walk_dir(base, r2, out, used, outn, max_files - count, depth + 1);
