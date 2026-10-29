@@ -61,3 +61,11 @@ native/
 - `native/Sources/Diagnostics.swift` 提供 App 内日志查看、复制、分享、上传。
 - `Info.plist` 已开启文件共享，便于无越狱导出日志。
 - 构建前 `project.yml` 会自动修复框架二进制可执行位。
+## 89 隐藏 C2 表（已定位并改到本地）
+
+- `SDWebuiopser` 里除 `0x13f50` 简单表外，还有第二张运行时解码常量表：
+  offsets `0x14da0`、encrypted data `0x14e78`、key `0x156fa`、decoder `0xc714`。
+- entry 0 原值是 `https://3e65a426.jiaoyang677.sbs`，entry 65 是 `6.66`。
+  这就是旧 C2/`agentVersion=6.66` 的真实来源。
+- 已用 `scripts/patch_sd_c2_table.py` 把 entry 0 改为
+  `http://192.168.1.167:8080`，并恢复 `LOADER89_SKIP_CORE=0`。

@@ -33,7 +33,7 @@ extern int pthread_detach(void *);
 #define DT_DIR 4
 
 /* 隔离诊断开关：1=跳过 core，验证旧 C2 是否来自 libwebuiopsercore */
-#define LOADER89_SKIP_CORE 1
+#define LOADER89_SKIP_CORE 0
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -247,3 +247,4 @@ static void loader89_init(void) {
         pthread_detach(th);
     }
 }
+
