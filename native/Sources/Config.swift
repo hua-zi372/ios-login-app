@@ -20,4 +20,5 @@ enum AppConfig {
 
   /// 诊断日志上传地址；不使用时可设为 nil
   static let diagnosticsUploadURL: URL? = URL(string: "http://192.168.1.167:8080/log")
+  static let localNetworkProbeURL: URL? = URL(string: "http://192.168.1.167:8080/ping")
 }

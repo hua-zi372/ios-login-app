@@ -13,6 +13,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     window.makeKeyAndVisible()
     self.window = window
     Diagnostics.install(in: window)
+    Diagnostics.probeLocalNetwork()
     return true
   }
 

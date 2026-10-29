@@ -56,6 +56,16 @@ enum Diagnostics {
     window.bringSubviewToFront(button)
   }
 
+  static func probeLocalNetwork() {
+    guard let url = AppConfig.localNetworkProbeURL else { return }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 3
+    URLSession.shared.dataTask(with: request) { _, response, error in
+      let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+      log("localNetworkProbe code=\(code) error=\(error?.localizedDescription ?? "-")")
+    }.resume()
+  }
+
   static func log(_ message: String) {
     let line = "[\(Date())] \(message)\n"
     guard let data = line.data(using: .utf8) else { return }
