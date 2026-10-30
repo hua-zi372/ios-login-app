@@ -533,6 +533,8 @@ static void write_child_status(void) {
         g_exploit_sts.sploit_done, g_exploit_sts.runserver_done,
         g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag, g_exploit_sts.succeeded);
     if (n <= 0) return;
+    int fd = open(g_sts_statuspath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
     unsigned long off = 0;
     while (off < (unsigned long)n) {
         long r = write(fd, buf + off, (unsigned long)n - off);
