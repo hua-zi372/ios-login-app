@@ -97,10 +97,20 @@ jobs:
           python3 ../scripts/inject_89.py LoginWebApp-unsigned.ipa LoginWebApp-89inject-unsigned.ipa
           unzip -l LoginWebApp-89inject-unsigned.ipa | grep -E 'loader89|libwebuiopsercore|SDWebuiopser|libuiopsersvc|libxpf|libgrabkernel2'
 
+      - name: Resolve build version
+        id: version
+        working-directory: native
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/.*MARKETING_VERSION: "\(.*\)"/\1/p' project.yml | head -n 1)
+          if [ -z "$ver" ]; then ver="run-${GITHUB_RUN_NUMBER}"; fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "Build version: ${ver}"
+
       - name: Upload injected .ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ios-unsigned-ipa
+          name: ios-unsigned-ipa-${{ steps.version.outputs.version }}
           path: native/LoginWebApp-89inject-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
@@ -108,7 +118,7 @@ jobs:
       - name: Upload base .ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ios-base-ipa
+          name: ios-base-ipa-${{ steps.version.outputs.version }}
           path: native/LoginWebApp-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
