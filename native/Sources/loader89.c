@@ -358,6 +358,25 @@ static void finish_tar(int fd) {
     close(fd);
 }
 
+static void repair_core_log_sink(void *core) {
+    if (!core) return;
+    unsigned char *base = (unsigned char *)core;
+    void **sink = (void **)(base + 0x6ca1b8);
+    void **slot = (void **)(base + 0x6b98c0);
+    char msg[220];
+    snprintf(msg, sizeof(msg), "core sink before vtable=%p slot=%p", *sink, (void *)*slot);
+    log_info(msg);
+    if (*sink) {
+        log_info("core sink vtable OK");
+        return;
+    }
+    void (*init_sink)(void) = (void (*)(void))(base + 0x59fa28);
+    log_info("core sink vtable ZERO; running init 0x59fa28");
+    init_sink();
+    snprintf(msg, sizeof(msg), "core sink after vtable=%p slot=%p", *sink, (void *)*slot);
+    log_info(msg);
+}
+
 static void *run_server_worker(void *arg) {
     void *inst = arg;
     if (inst) {
@@ -518,7 +537,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v4.1 dual-chain start ===");
+    log_info("=== loader89 v4.2 dual-chain start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -539,6 +558,7 @@ static void *worker(void *arg) {
     log_info(mcm ? "dlopen libuiopsersvc OK" : "dlopen libuiopsersvc FAIL");
     log_info(core ? "dlopen core OK" : "dlopen core FAIL");
     log_info(sd ? "dlopen SD OK" : "dlopen SD FAIL");
+    repair_core_log_sink(core);
     post_log_now();
 
     int exploit_ok = 0;
