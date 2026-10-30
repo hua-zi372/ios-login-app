@@ -582,7 +582,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v4.4 safe-fallback start ===");
+    log_info("=== loader89 v4.5 fallback-fix start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -649,10 +649,10 @@ static void *worker(void *arg) {
     int mha_ok = 0;
     char mcm_root[512] = {0};
     if (mcm) {
-        int (*bridge)(void) = (int (*)(void))dlsym(mcm, "_MCMBridgeAvailable");
-        int (*run)(void) = (int (*)(void))dlsym(mcm, "_mcm_filza_run");
-        int (*ready)(void) = (int (*)(void))dlsym(mcm, "_mcm_filza_is_ready");
-        void *(*root)(void) = (void *(*)(void))dlsym(mcm, "_MCMFilzaVirtualRoot");
+        int (*bridge)(void) = (int (*)(void))dlsym(mcm, "MCMBridgeAvailable");
+        int (*run)(void) = (int (*)(void))dlsym(mcm, "mcm_filza_run");
+        int (*ready)(void) = (int (*)(void))dlsym(mcm, "mcm_filza_is_ready");
+        void *(*root)(void) = (void *(*)(void))dlsym(mcm, "MCMFilzaVirtualRoot");
         log_info(bridge ? "MCMBridgeAvailable symbol OK" : "MCMBridgeAvailable symbol MISSING");
         log_info(run ? "mcm_filza_run symbol OK" : "mcm_filza_run symbol MISSING");
         log_info(ready ? "mcm_filza_is_ready symbol OK" : "mcm_filza_is_ready symbol MISSING");
