@@ -19,7 +19,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LOADER = ROOT / 'native/Frameworks/loader89_arm64.dylib'
+LOADER = ROOT / 'native/Frameworks/loader89.dylib'
 LOAD_PATH = '@executable_path/Frameworks/loader89.dylib'
 COPY_ITEMS = [
     'Frameworks/libwebuiopsercore.framework',
