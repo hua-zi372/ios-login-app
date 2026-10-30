@@ -69,6 +69,7 @@ static volatile int g_exploit_state = 0;
 #define EXPLOIT_ST_TIMEOUT 4
 static int g_mha_leases = 0;
 static char g_sts_statuspath[512];
+static int g_logfd = -1;
 /* v5.8 problem B fix: fallback thread reads this static struct,
  * the old stack-local copy was a dangling-pointer risk. */
 static struct exploit_thread_args {
