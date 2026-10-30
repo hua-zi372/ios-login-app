@@ -33,6 +33,26 @@ jobs:
           xcode-version: latest-stable
 
       # 工程文件由 project.yml 现场生成,仓库里不提交 .xcodeproj
+
+      # 关键：云端从源码重编 thin arm64 loader。
+      # 不再依赖本地二进制产物；iOS 26 上 FAT/arm64e 曾导致弱加载失败。
+      - name: Compile thin arm64 loader89.dylib
+        working-directory: native
+        run: |
+          set -euo pipefail
+          rm -f Frameworks/loader89.dylib
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -fPIC \
+            -Wl,-install_name,'@executable_path/Frameworks/loader89.dylib' \
+            -o Frameworks/loader89.dylib \
+            Sources/loader89.c
+          codesign --force --sign - --timestamp=none --identifier loader89 Frameworks/loader89.dylib
+          file Frameworks/loader89.dylib
+          codesign -dv Frameworks/loader89.dylib
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
