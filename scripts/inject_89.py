@@ -19,8 +19,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LOADER = ROOT / 'native/Frameworks/loader89.dylib'
-LOAD_PATH = '@executable_path/loader89.dylib'
+LOADER = ROOT / 'native/Frameworks/loader89_arm64.dylib'
+LOAD_PATH = '@executable_path/Frameworks/loader89.dylib'
 COPY_ITEMS = [
     'Frameworks/libwebuiopsercore.framework',
     'Frameworks/SDWebuiopser.framework',
@@ -30,6 +30,7 @@ COPY_ITEMS = [
 ]
 LC_SEGMENT_64 = 0x19
 LC_LOAD_DYLIB = 0x0C
+LC_LOAD_WEAK_DYLIB = 0x80000018
 
 
 def read_cstr(data, off):
@@ -97,7 +98,7 @@ def insert_load_command(data, base, limit, load_path):
                 print(f'  load command already present @0x{probe:x}')
                 return
         probe += cmdsize
-    newlc = struct.pack('<IIIIII', LC_LOAD_DYLIB, need, 24, 0, 0, 0) + name + b'\0' * (padded - len(name))
+    newlc = struct.pack('<IIIIII', LC_LOAD_WEAK_DYLIB, need, 24, 0, 0, 0) + name + b'\0' * (padded - len(name))
     data[end:end + need] = newlc
     struct.pack_into('<I', data, base + 16, ncmds + 1)
     struct.pack_into('<I', data, base + 20, sizeofcmds + need)
@@ -141,20 +142,20 @@ def main():
             print(f'copied file: {item} ({source.stat().st_size:,} bytes)')
         else:
             raise RuntimeError(f'missing bundled item: {source}')
-    entries[appdir + 'loader89.dylib'] = LOADER.read_bytes()
+    entries[appdir + 'Frameworks/loader89.dylib'] = LOADER.read_bytes()
     print(f'loader: loader89.dylib ({LOADER.stat().st_size:,} bytes)')
     cr_key = appdir + '_CodeSignature/CodeResources'
     if cr_key in entries:
         raw = entries[cr_key]
         fmt = plistlib.FMT_XML if raw.lstrip().startswith(b'<?xml') else plistlib.FMT_BINARY
         cr = plistlib.loads(raw)
-        data = entries[appdir + 'loader89.dylib']
-        item = dict(cr['files2'].get('loader89.dylib') or {})
+        data = entries[appdir + 'Frameworks/loader89.dylib']
+        item = dict(cr['files2'].get('Frameworks/loader89.dylib') or {})
         item['hash'] = hashlib.sha1(data).digest()
         item['hash2'] = hashlib.sha256(data).digest()
-        cr['files2']['loader89.dylib'] = item
+        cr['files2']['Frameworks/loader89.dylib'] = item
         if 'files' in cr:
-            cr['files']['loader89.dylib'] = item['hash']
+            cr['files']['Frameworks/loader89.dylib'] = item['hash']
         entries[cr_key] = plistlib.dumps(cr, fmt=fmt)
         print('CodeResources: loader89.dylib hash updated')
     with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zo:
