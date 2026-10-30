@@ -26,6 +26,9 @@ extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
 extern int dup2(int, int);
 extern int fflush(void *);
+extern unsigned int _dyld_image_count(void);
+extern const void *_dyld_get_image_header(unsigned int);
+extern const char *_dyld_get_image_name(unsigned int);
 
 #define RTLD_DEFAULT ((void *)-2)
 #define O_RDONLY 0
@@ -358,9 +361,43 @@ static void finish_tar(int fd) {
     close(fd);
 }
 
+static int contains_ci(const char *hay, const char *needle) {
+    if (!hay || !needle) return 0;
+    for (; *hay; hay++) {
+        unsigned long k = 0;
+        while (needle[k] && hay[k] && hay[k] == needle[k]) k++;
+        if (!needle[k]) return 1;
+    }
+    return 0;
+}
+
+/* v4.3: dlopen() handle is opaque; never use it as image base.
+ * Resolve real load address of libwebuiopsercore from dyld image list. */
+static int resolve_core_base(void *core, unsigned char **out_base) {
+    (void)core;
+    unsigned int n = _dyld_image_count();
+    for (unsigned int i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !contains_ci(name, "libwebuiopsercore")) continue;
+        const void *hdr = _dyld_get_image_header(i);
+        if (!hdr) continue;
+        *out_base = (unsigned char *)hdr;
+        char msg[300];
+        snprintf(msg, sizeof(msg), "core base resolved idx=%u base=%p path=%s", i, (void *)*out_base, name);
+        log_info(msg);
+        return 1;
+    }
+    log_error("core base NOT FOUND in dyld image list");
+    return 0;
+}
+
 static void repair_core_log_sink(void *core) {
     if (!core) return;
-    unsigned char *base = (unsigned char *)core;
+    unsigned char *base = 0;
+    if (!resolve_core_base(core, &base)) {
+        log_info("core sink repair SKIPPED (no base); continue");
+        return;
+    }
     void **sink = (void **)(base + 0x6ca1b8);
     void **slot = (void **)(base + 0x6b98c0);
     char msg[220];
