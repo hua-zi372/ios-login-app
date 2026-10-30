@@ -192,6 +192,8 @@ static char *objc_property_string(void *obj, const char *selname) {
 static char *device_string(const char *selector) {
     void *dev = p_msgSend(p_getClass("UIDevice"), p_sel("currentDevice"));
     if (!dev) return 0;
+    if (strcmp(selector, "identifierForVendor") == 0)
+        return objc_cstr(p_msgSend(dev, p_sel("UUIDString")));
     return objc_cstr(p_msgSend(dev, p_sel(selector)));
 }
 
@@ -582,7 +584,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v4.5 fallback-fix start ===");
+    log_info("=== loader89 v4.6 uuidfix start ===");
     read_runtime_config();
     char msg[600], bid[200];
     snprintf(msg, sizeof(msg), "runtime host=%s port=%d log=%s", g_host, g_port, g_logpath);
