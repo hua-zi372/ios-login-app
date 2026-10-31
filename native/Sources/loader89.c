@@ -1106,7 +1106,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.0 onemain-noinit-clash start ===");
+    log_info("=== loader89 v6.0.1 B-retry-start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;

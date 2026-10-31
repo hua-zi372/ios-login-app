@@ -49,8 +49,8 @@ targets:
         INFOPLIST_FILE: Info.plist
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1,2"
-        MARKETING_VERSION: "6.0.0"
-        CURRENT_PROJECT_VERSION: "60"
+        MARKETING_VERSION: "6.0.1"
+        CURRENT_PROJECT_VERSION: "601"
         ENABLE_BITCODE: NO
         OTHER_CFLAGS: "$(inherited) -DLOADER89_APP_DISABLED=1"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
