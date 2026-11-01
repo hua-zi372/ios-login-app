@@ -1158,7 +1158,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.2 netsink-stub start ===");
+    log_info("=== loader89 v6.3 exploit-enabled start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
