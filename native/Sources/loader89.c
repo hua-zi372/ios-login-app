@@ -870,7 +870,9 @@ static int read_child_status(void) {
         g_exploit_sts.phase[k] = 0;
     }
     if ((v = strstr(buf, "\"phase_ts\":"))) g_exploit_sts.phase_ts = (long)atoi(v + 11);
-    if ((v = strstr(buf, "\"core_base_resolved\":"))) g_exploit_sts.core_base_resolved = atoi(v + 20);
+    /* core_base_resolved is 18 chars: quote(0) + key(1..18) + quote(19) + colon(20) + value(21). +20 parsed ":1" as 0 and the
+     * line-880 guard then killed every real exploit success. */
+    if ((v = strstr(buf, "\"core_base_resolved\":"))) g_exploit_sts.core_base_resolved = atoi(v + 21);
     if ((v = strstr(buf, "\"raw_flag\":"))) g_exploit_sts.raw_flag = atoi(v + 11);
     if ((v = strstr(buf, "\"sploit_done\":"))) g_exploit_sts.sploit_done = atoi(v + 14);
     if ((v = strstr(buf, "\"runserver_done\":"))) g_exploit_sts.runserver_done = atoi(v + 17);
@@ -1366,7 +1368,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.6 manual-inits start ===");
+    log_info("=== loader89 v6.6.1 manual-inits start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
